@@ -74,7 +74,7 @@ scene fills in, for each cell:
 |---|---|
 | `lum` | brightness, 0 to 1 |
 | `r`, `g`, `b` | colour, 0 to 255 |
-| `shimmer` | how fast the cell's letter rotates inside its brightness group: 1 (the default) is the normal rate, 0 holds the letter still, 2 is twice as fast. A star could use 0.2 for a slow twinkle and an ember 3. A cell cannot change letter more than once a frame, so at 30 fps nothing above about 2.5 looks different |
+| `shimmer` | how fast the cell's letter rotates inside its brightness group: 1 (the default) is the normal rate, 2 is twice as fast, and 0 shows the first letter of the group in every such cell (no scatter, no rotation), so a cell that must hold still, and look the same as its neighbours, uses 0. Any value above 0, however small, shows the varied letters, only very slowly. A star could use 0.2 for a slow twinkle and an ember 3. A cell cannot change letter more than once a frame, so at 30 fps nothing above about 2.5 looks different |
 | `alt_lum`, `alt_r`, `alt_g`, `alt_b` | the alt colour, the other colour of the pair: brightness 0 to 1 and colour 0 to 255. See below. The default, `alt_lum = 0`, means none |
 | `text`, `ch`, `inv` | a letter the scene chooses itself: when `text` is set the cell is drawn as the character `ch` (inverse video if `inv`) in the colour `r`, `g`, `b`, and `lum` and `shimmer` are ignored |
 

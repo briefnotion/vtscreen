@@ -166,7 +166,9 @@ inline std::string to_utf8(const std::u32string& s) {
 // One cell of a scene's picture. Normally: how bright it is, what colour, and how
 // fast its letter shimmers; the Display picks the letter. lum is 0..1; r, g, b are
 // 0..255; shimmer is a speed, 1 = the normal rate (the letter inside its group
-// changes once every SHIMMER_FRAMES frames), 0 = frozen, 3 = three times as fast.
+// changes once every SHIMMER_FRAMES frames), 3 = three times as fast. A shimmer of 0 (or
+// less) shows the first letter of the group, the same in every such cell: no scatter, no
+// rotation. Any shimmer above 0, however small, shows the varied letters.
 //
 // The alt colour is the other colour of the pair every cell has. The primary
 // colour r, g, b is the letter in a dim cell and the solid block in a bright (inverse)
@@ -323,15 +325,17 @@ inline int quant(double v) {
 // 16 brightness steps. 0 .. 0.5 uses groups 0..7 as they are; 0.5 .. 1 uses
 // groups 7..0 drawn in inverse video, so the hottest cells are solid colour.
 // The group picks the letters; position and time pick one, so it shimmers.
-// shimmer is the cell's speed (PicCell::shimmer): 1 = the normal rate, 0 = the
-// letter stays put, 3 = three times as fast. Below 0 counts as 0.
+// shimmer is the cell's speed (PicCell::shimmer): 1 = the normal rate, 3 = three times as
+// fast. 0 (or below) is the first letter of the group, the same everywhere; above 0 the
+// letter is picked by position (and moves with time at that speed).
 inline char pick_char(double lum, int i, int j, double t, int fps, bool& inv,
                       bool hash = false, double shimmer = 1.0) {
     int n = (int)LEVELS.size();
     int step = std::min(std::max((int)(lum * 2 * n), 0), 2 * n - 1);
     inv = step >= n;
     const std::string& g = LEVELS[inv ? 2 * n - 1 - step : step];
-    const long ticks = (long)(t * fps / SHIMMER_FRAMES * (shimmer > 0 ? shimmer : 0.0));
+    if (shimmer <= 0) return g[0];                 // still: the group's first letter, the same in every cell
+    const long ticks = (long)(t * fps / SHIMMER_FRAMES * shimmer);
     if (hash) {
         uint32_t h = (uint32_t)i * 73856093u ^ (uint32_t)j * 19349663u ^
                      (uint32_t)ticks * 83492791u;
