@@ -879,7 +879,7 @@ private:
                 if (k == sh) continue;
                 // A short gap of unchanged cells is cheaper to write again than to
                 // skip with a cursor move, when no colour or inverse code is needed.
-                if (cur_r == i && cur_c >= 0 && j - cur_c <= 3) {
+                if (cur_r == i && cur_c >= 0 && j >= cur_c && j - cur_c <= 3) {
                     bool free = true;
                     for (int x = cur_c; x < j && free; x++) {
                         const VtCell& u = shown.at(i, x);
