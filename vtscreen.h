@@ -539,6 +539,7 @@ public:
     bool color = true;            // send colour codes
     bool hash_letters = false;    // how the letter inside a group is chosen
     int  fps = 30;                // the shimmer speed follows this
+    bool quit_on_q = true;        // q (or Q) quits; a program that lets the person type text turns it off
 
     // pic_rows is the height of the pictures it will be given (Picture::init's R);
     // the status bar is one more row underneath, as in a Picture.
@@ -715,8 +716,8 @@ public:
         if (t - fps_start_ >= 1.0) { actual_ = fps_frames_ / (t - fps_start_); fps_frames_ = 0; fps_start_ = t; }
     }
 
-    // The next key pressed since the last call (other than q, which quits), or 0
-    // if there is none. Keys are collected by end_frame().
+    // The next key pressed since the last call (other than q, which quits unless quit_on_q is
+    // false), or 0 if there is none. Keys are collected by end_frame().
     char next_key() {
         if (keys_.empty()) return 0;
         char c = keys_.front();
@@ -763,7 +764,7 @@ public:
                 if (rc > 0) {
                     char c;
                     while (read(STDIN_FILENO, &c, 1) == 1) {
-                        if (c == 'q' || c == 'Q') g_stop = 1;
+                        if (quit_on_q && (c == 'q' || c == 'Q')) g_stop = 1;
                         else keys_.push_back(c);
                     }
                 } else if (rc < 0 && errno == EINTR && !g_stop && n_ * dt - time() > 0.001) {
@@ -810,7 +811,7 @@ private:
                 wchar_t w = rec[i].Event.KeyEvent.uChar.UnicodeChar;
                 if (w <= 0 || w >= 128) continue;
                 char c = (char)w;
-                if (c == 'q' || c == 'Q') g_stop = 1;
+                if (quit_on_q && (c == 'q' || c == 'Q')) g_stop = 1;
                 else keys_.push_back(c);
             }
         }
