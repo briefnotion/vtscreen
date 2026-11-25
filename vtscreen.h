@@ -40,6 +40,7 @@
 #endif
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cerrno>
@@ -50,6 +51,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #ifdef VTSCREEN_WINDOWS
@@ -82,6 +84,19 @@
 
 #ifndef M_PI                      // Visual C++ only defines it with _USE_MATH_DEFINES
 #define M_PI 3.14159265358979323846
+#endif
+
+// Defined when the library has retained pictures (Picture::retain), so a program can tell.
+#define VTSCREEN_RETAINED 1
+
+// The one place a letter is worked out for a cell is the hot path of every frame; a compiler does not always inline it
+// by itself, and it is a good deal slower when it does not.
+#if defined(_MSC_VER)
+#define VTSCREEN_FORCE_INLINE __forceinline
+#elif defined(__GNUC__) || defined(__clang__)
+#define VTSCREEN_FORCE_INLINE inline __attribute__((always_inline))
+#else
+#define VTSCREEN_FORCE_INLINE inline
 #endif
 
 namespace vtscreen {
@@ -190,22 +205,107 @@ struct PicCell {
     bool text = false;
     char32_t ch = U' ';
     bool inv = false;
+
+    bool operator==(const PicCell& o) const {
+        return lum == o.lum && r == o.r && g == o.g && b == o.b && shimmer == o.shimmer &&
+               alt_lum == o.alt_lum && alt_r == o.alt_r && alt_g == o.alt_g && alt_b == o.alt_b &&
+               text == o.text && ch == o.ch && inv == o.inv;
+    }
+    bool operator!=(const PicCell& o) const { return !(*this == o); }
 };
+
+namespace detail {
+// Every Picture has a number of its own, so a Display can tell which picture it showed last.
+inline uint64_t next_picture_serial() {
+    static std::atomic<uint64_t> n(0);
+    return ++n;
+}
+}  // namespace detail
 
 // What a scene draws on: a grid of PicCells, rows * cols, row by row, the same
 // shape as a VtScreen (which holds the finished letters), so it is the whole
 // terminal. The Display turns it into letters. The last row is the status bar.
+//
+// Retained mode. Usually a program fills the whole picture again every frame, and the
+// Display looks at every cell. A program that keeps its picture between frames and only
+// changes what has changed can say so (retain()): the Picture then notes which cells were
+// written (touched), and the Display only looks at those, and at the cells that shimmer
+// (their letter changes with time), and skips the rest. The picture is the same either way,
+// and so is what is sent; only the work differs.
+//
+// The rules of retained mode:
+//   - write cells through at(), set() or text(), never straight into `cell`: that cannot be
+//     noticed. (A program that does write into `cell` should not call retain(), or should call
+//     touch_all() afterwards.)
+//   - at() counts as a write: it may be a false alarm (the cell may end up as it was), which
+//     costs one cheap check and nothing else. set() and text() only count as a write when
+//     the cell really is different, so a program that sets the same thing every frame costs nothing.
+//   - init() starts over (every cell is new); a Picture that is copied or moved into is new too.
+//   - the flags are used up by a Display's render, so skipped frames lose nothing.
+// Without retain() nothing is noted and every cell is looked at, as it always was.
 struct Picture {
     int rows = 0, cols = 0;
     std::vector<PicCell> cell;
 
+    bool retained = false;                    // see above
+    uint64_t serial = detail::next_picture_serial();
+
+    // Bookkeeping for retained mode; changed by a Display's render even for a const Picture.
+    mutable bool all_touched = true;                     // every cell is new (init, a copy, a resize)
+    mutable std::vector<unsigned char> touched;          // per cell: written since a render last looked
+    mutable std::vector<unsigned char> animated;         // per cell: shimmering, so its letter moves with time
+    mutable std::vector<unsigned char> row_touched;      // per row: a cell in it is touched
+    mutable std::vector<int> animated_in_row;            // per row: how many of its cells are animated
+
+    Picture() = default;
+    // A copy has a number of its own, and every cell of it is new.
+    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained) {}
+    Picture& operator=(const Picture& o) {
+        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; forget_flags(); }
+        return *this;
+    }
+    Picture(Picture&& o) noexcept : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained) { o.forget_flags(); }
+    Picture& operator=(Picture&& o) noexcept {
+        if (this != &o) {
+            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained;
+            forget_flags(); o.forget_flags();
+        }
+        return *this;
+    }
+
     // Size it and clear every cell to the default. R is the rows of the picture
     // proper (what setup() was given); the status bar's row comes underneath, so
     // rows ends up R + 1.
-    void init(int R, int C) { rows = R + 1; cols = C; cell.assign((size_t)(R + 1) * C, PicCell()); }
+    void init(int R, int C) {
+        rows = R + 1; cols = C;
+        cell.assign((size_t)(R + 1) * C, PicCell());
+        forget_flags();
+    }
     int bar_row() const { return rows - 1; }
-    PicCell& at(int i, int j) { return cell[(size_t)i * cols + j]; }
+
+    // Keep this picture between frames and note what is written (see above).
+    void retain() { retained = true; all_touched = true; }
+    // Say that a cell, or the whole picture, was changed some other way than through at(), set() or text().
+    void touch(int i, int j) const {
+        ensure_flags();
+        touched[(size_t)i * cols + j] = 1;
+        row_touched[(size_t)i] = 1;
+    }
+    void touch_all() const { all_touched = true; }
+
+    PicCell& at(int i, int j) {
+        if (retained) touch(i, j);
+        return cell[(size_t)i * cols + j];
+    }
     const PicCell& at(int i, int j) const { return cell[(size_t)i * cols + j]; }
+
+    // Put a cell there. In retained mode it only counts as a write if it is different.
+    void set(int i, int j, const PicCell& v) {
+        PicCell& c = cell[(size_t)i * cols + j];
+        if (c == v) return;
+        c = v;
+        if (retained) touch(i, j);
+    }
 
     // Write s (UTF-8) as text cells along row, starting at col, over whatever is
     // there. The default colour is the readout grey. What does not fit on the
@@ -217,11 +317,35 @@ struct Picture {
         for (size_t k = 0; k < u.size(); k++) {
             const int j = col + (int)k;
             if (j < 0 || j >= cols) continue;
-            PicCell& c = at(row, j);
-            c = PicCell();
+            PicCell c;
             c.text = true; c.ch = u[k]; c.inv = inv;
             c.r = r; c.g = g; c.b = b;
+            set(row, j, c);
         }
+    }
+
+    // For the Display: size the flags to the picture (a picture whose size changed is all new).
+    void ensure_flags() const {
+        if (touched.size() != cell.size() || row_touched.size() != (size_t)rows) {
+            touched.assign(cell.size(), 0);
+            animated.assign(cell.size(), 0);
+            row_touched.assign((size_t)rows, 0);
+            animated_in_row.assign((size_t)rows, 0);
+            all_touched = true;
+        }
+    }
+    // For the Display: a render has looked at everything that was touched.
+    void consume() const {
+        ensure_flags();
+        std::fill(touched.begin(), touched.end(), (unsigned char)0);
+        std::fill(row_touched.begin(), row_touched.end(), (unsigned char)0);
+        all_touched = false;
+    }
+
+private:
+    void forget_flags() const {
+        all_touched = true;
+        touched.clear(); animated.clear(); row_touched.clear(); animated_in_row.clear();
     }
 };
 
@@ -267,6 +391,7 @@ inline void fade(const Picture& a, const Picture& b, double pct, Picture& out) {
     const double wa = 1.0 - pct, wb = pct;
     out.rows = a.rows; out.cols = a.cols;
     out.cell.resize(a.cell.size());
+    out.touch_all();                          // every cell is written below
     for (size_t i = 0; i < a.cell.size(); i++) {
         const PicCell& p = a.cell[i];
         const PicCell& q = b.cell[i];
@@ -421,12 +546,11 @@ struct VtCell {
     bool alt = false;                         // an alt colour is set (see PicCell)
     unsigned char ar = 0, ag = 0, ab = 0;     // it, already scaled by its brightness
 
-    bool operator==(const VtCell& o) const {
-        return ch == o.ch && inv == o.inv && r == o.r && g == o.g && b == o.b &&
-               alt == o.alt && ar == o.ar && ag == o.ag && ab == o.ab;
-    }
+    // Twelve bytes and no padding (checked below), so equal cells are equal bytes: one compare for all of it.
+    bool operator==(const VtCell& o) const { return std::memcmp(this, &o, sizeof(VtCell)) == 0; }
     bool operator!=(const VtCell& o) const { return !(*this == o); }
 };
+static_assert(sizeof(VtCell) == sizeof(char32_t) + 2 * 4 * sizeof(unsigned char), "VtCell must have no padding");
 
 inline VtCell make_cell(char32_t ch, bool inv, int r, int g, int b, bool alt = false,
                         int ar = 0, int ag = 0, int ab = 0) {
@@ -538,6 +662,13 @@ static std::string status(int cols, double t, bool color, bool loop) {
 // last colour and inverse flag sent) and cursor, so codes and cursor moves are
 // only sent when they have to be. It does not matter which Picture is shown from
 // one frame to the next: the first frame after a switch sends the differences.
+//
+// It keeps two screens between frames: `target`, the letters the terminal should show, and
+// `shown`, the letters it was last sent. Whenever a cell of `target` changes, that cell and
+// its row are flagged; the flags are only a hint to where to look, so sending only has to
+// visit the flagged cells (and a frame with nothing flagged sends nothing and costs nothing
+// to scan). A cell that is not flagged is the same in both screens. With a retained Picture
+// (see Picture) the letters of untouched, still cells are not even worked out again.
 class Display {
 public:
     bool color = true;            // send colour codes
@@ -550,6 +681,10 @@ public:
     void init(int pic_rows, int cols) {
         shown.init(pic_rows + 1, cols);
         target.init(pic_rows + 1, cols);
+        changed_.assign((size_t)(pic_rows + 1) * (size_t)cols, 0);
+        row_changed_.assign((size_t)(pic_rows + 1), 0);
+        any_changed_ = false;
+        have_last_ = false;
     }
 
     // The terminal changed size: cols x rows is the whole terminal, as in open().
@@ -565,6 +700,19 @@ public:
     // clear the terminal and forget everything: the next render sends it all
     std::string refresh() {
         for (VtCell& k : shown.cell) k = VtCell();
+        // the terminal is blank now: every cell that is not blank has to be sent again
+        any_changed_ = false;
+        if (changed_.size() == target.cell.size()) {
+            for (int i = 0; i < target.rows; i++) {
+                row_changed_[(size_t)i] = 0;
+                for (int j = 0; j < target.cols; j++) {
+                    const size_t idx = (size_t)i * target.cols + j;
+                    const bool differs = target.cell[idx] != VtCell();
+                    changed_[idx] = differs;
+                    if (differs) { row_changed_[(size_t)i] = 1; any_changed_ = true; }
+                }
+            }
+        }
         pen_inv = 0; pr = pg = pb = -1; pen_alt = false; par = pag = pab = -1;
         cur_r = cur_c = -1;
         return "\x1b[0m\x1b[H\x1b[2J";
@@ -585,8 +733,9 @@ public:
     void bar(Picture& pic, const Info& info, double t, bool loop,
              const std::string& title_suffix = "") const {
         const int row = pic.bar_row();
+        const Picture& looking = pic;              // a look, not a write
         for (int j = 0; j < pic.cols; j++)
-            if (pic.at(row, j).text) return;
+            if (looking.at(row, j).text) return;
         const std::string title = std::string(info.title) + title_suffix;
         Info shown_info = info;
         shown_info.title = title.c_str();
@@ -841,46 +990,97 @@ private:
 
     VtScreen shown;                               // what the terminal is showing
     VtScreen target;                              // the picture as letters, this frame
+    std::vector<unsigned char> changed_;          // per cell: target may differ from shown (a hint)
+    std::vector<unsigned char> row_changed_;      // per row: a cell in it is flagged
+    bool any_changed_ = false;                    // anything is flagged
+    // What the last render was done with: when any of it changes, every letter is worked out again.
+    bool have_last_ = false, last_color_ = true, last_hash_ = false;
+    int last_fps_ = 30;
+    uint64_t last_serial_ = 0;                    // the Picture it was done for
     int pen_inv = 0, pr = -1, pg = -1, pb = -1;   // what the terminal will use next
     bool pen_alt = false;                         // ... and its background colour (none, or
     int par = -1, pag = -1, pab = -1;             //     this one)
     int cur_r = -1, cur_c = -1;                   // where its cursor is (-1: unknown)
 
-    // brightness and colour -> letter, inverse flag and rounded colour per cell
-    void to_letters(const Picture& F, double t) {
-        const int R = target.rows, C = target.cols;
-        for (int i = 0; i < R; i++) {
-            for (int j = 0; j < C; j++) {
-                const PicCell& pc = F.cell[i * C + j];
-                const bool alt = color && pc.alt_lum > 0;
-                const double al = detail::clampd(pc.alt_lum, 0, 1);
-                if (pc.text) {                  // a letter the scene chose: as it is
-                    target.set(i, j, pc.ch, pc.inv, detail::byte(pc.r), detail::byte(pc.g),
-                               detail::byte(pc.b), alt, detail::byte(pc.alt_r * al),
-                               detail::byte(pc.alt_g * al), detail::byte(pc.alt_b * al));
-                    continue;
-                }
-                bool inv;
-                char ch = pick_char(pc.lum, i, j, t, fps, inv, hash_letters, pc.shimmer);
-                int px[3] = {0, 0, 0};
-                if (color) {
-                    px[0] = quant(pc.r); px[1] = quant(pc.g); px[2] = quant(pc.b);
-                }
-                target.set(i, j, ch, inv, px[0], px[1], px[2], alt, quant(pc.alt_r * al),
-                           quant(pc.alt_g * al), quant(pc.alt_b * al));
-            }
+    // brightness and colour -> letter, inverse flag and rounded colour, for one cell
+    VTSCREEN_FORCE_INLINE void letter(const PicCell& pc, int i, int j, double t, VtCell& out) const {
+        const bool alt = color && pc.alt_lum > 0;
+        const double al = detail::clampd(pc.alt_lum, 0, 1);
+        if (pc.text) {                  // a letter the scene chose: as it is
+            out = make_cell(pc.ch, pc.inv, detail::byte(pc.r), detail::byte(pc.g),
+                            detail::byte(pc.b), alt, detail::byte(pc.alt_r * al),
+                            detail::byte(pc.alt_g * al), detail::byte(pc.alt_b * al));
+            return;
         }
+        bool inv;
+        char ch = pick_char(pc.lum, i, j, t, fps, inv, hash_letters, pc.shimmer);
+        int px[3] = {0, 0, 0};
+        if (color) {
+            px[0] = quant(pc.r); px[1] = quant(pc.g); px[2] = quant(pc.b);
+        }
+        out = make_cell(ch, inv, px[0], px[1], px[2], alt, quant(pc.alt_r * al),
+                        quant(pc.alt_g * al), quant(pc.alt_b * al));
     }
 
-    // compare target with shown and write the differences
+    // The picture as letters in target, flagging what is different. A retained Picture that is the same picture,
+    // the same size and shown with the same settings as last time only has its touched cells and its shimmering
+    // cells looked at; anything else, the whole picture.
+    void to_letters(const Picture& F, double t) {
+        const int R = target.rows, C = target.cols;
+        const bool same_settings = have_last_ && last_color_ == color && last_fps_ == fps && last_hash_ == hash_letters;
+        if (F.retained) F.ensure_flags();
+        const bool whole = !F.retained || F.all_touched || !same_settings || F.serial != last_serial_ ||
+                           F.rows != R || F.cols != C;
+        VtCell* const tgt = target.cell.data();
+        unsigned char* const chg = changed_.data();
+        unsigned char* const row_chg = row_changed_.data();
+        const PicCell* const src = F.cell.data();
+        const bool retained = F.retained, partial = !whole;
+        bool any = any_changed_;
+        if (retained && whole) {
+            std::fill(F.animated.begin(), F.animated.end(), (unsigned char)0);
+            std::fill(F.animated_in_row.begin(), F.animated_in_row.end(), 0);
+        }
+        // One loop for every case (the whole picture, or only what was touched or shimmers), so that the one place a
+        // letter is worked out is easy for the compiler to inline.
+        for (int i = 0; i < R; i++) {
+            if (partial && !F.row_touched[(size_t)i] && F.animated_in_row[(size_t)i] == 0) continue;
+            size_t idx = (size_t)i * C;
+            for (int j = 0; j < C; j++, idx++) {
+                if (partial && !F.touched[idx] && !F.animated[idx]) continue;
+                VtCell k;
+                letter(src[idx], i, j, t, k);
+                if (tgt[idx] != k) { tgt[idx] = k; chg[idx] = 1; row_chg[i] = 1; any = true; }
+                if (retained) {
+                    const bool moves = !src[idx].text && src[idx].shimmer > 0;     // does its letter change with time
+                    if (moves != (F.animated[idx] != 0)) {
+                        F.animated[idx] = moves;
+                        F.animated_in_row[(size_t)i] += moves ? 1 : -1;
+                    }
+                }
+            }
+        }
+        any_changed_ = any;
+        if (F.retained) F.consume();
+        have_last_ = true; last_color_ = color; last_fps_ = fps; last_hash_ = hash_letters;
+        last_serial_ = F.serial;
+    }
+
+    // compare the flagged cells of target with shown and write the differences
     std::string send() {
-        const int rows = shown.rows, cols = shown.cols;
         std::string out;
+        if (!any_changed_) return out;                  // nothing is flagged: nothing to look at, nothing to send
+        const int rows = shown.rows, cols = shown.cols;
         char esc[40];
         for (int i = 0; i < rows; i++) {
+            if (!row_changed_[(size_t)i]) continue;
+            row_changed_[(size_t)i] = 0;
             for (int j = 0; j < cols; j++) {
+                const size_t idx = (size_t)i * cols + j;
+                if (!changed_[idx]) continue;
+                changed_[idx] = 0;
                 const VtCell k = target.at(i, j);
-                VtCell& sh = shown.cell[(size_t)i * cols + j];
+                VtCell& sh = shown.cell[idx];
                 if (k == sh) continue;
                 // A short gap of unchanged cells is cheaper to write again than to
                 // skip with a cursor move, when no colour or inverse code is needed.
@@ -932,6 +1132,7 @@ private:
                 if (cur_c >= cols) cur_r = cur_c = -1;   // pending wrap: position unknown
             }
         }
+        any_changed_ = false;
         return out;
     }
 };

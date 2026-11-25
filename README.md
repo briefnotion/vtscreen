@@ -112,6 +112,71 @@ In a fade, text cells follow that rule: where both pictures have text the colour
 mixed and the letter comes from the picture that is ahead; where only one has text, that
 cell is taken as it is.
 
+## Retained pictures
+
+Usually a program fills its whole picture again every frame, and the Display looks at
+every cell. A program that keeps its picture between frames and changes only what has
+changed can say so: call `picture.retain()` once, after `init()`. The Picture then notes
+which cells were written (*touched*), and each frame the Display only works out the
+letters of the touched cells and of the cells that shimmer (their letter moves with
+time), and skips the rest. What ends up on the screen, and the bytes sent to the
+terminal, are exactly the same either way; only the work differs. A screen where nothing
+happens costs nothing: no letters are worked out, nothing is compared, nothing is sent.
+
+Measured on a 160 x 49 screen (microseconds a frame for `Display::render`, no terminal;
+`tests/bench_render.cpp`):
+
+| screen | ordinary | retained |
+|---|---|---|
+| all text, nothing changes | 112 | 0.2 |
+| all text, 20 cells change a frame | 122 | 13 |
+| 90 % still cells, 10 % shimmering | 339 | 119 |
+| every cell shimmering | 764 | 763 |
+
+The rules of retained mode:
+
+- Write cells with `at(i, j)`, `set(i, j, cell)` or `text(...)`, not straight into the
+  `cell` vector: that cannot be noticed. If a program does write into `cell`, it says so
+  with `touch(i, j)` or `touch_all()`.
+- `at()` counts as a write even if the cell ends up as it was (a false alarm costs one
+  cheap check). `set()` and `text()` only count when the cell is really different, so
+  setting the same thing every frame costs nothing. Reading through a `const Picture&`
+  is never a write.
+- `init()` starts the picture over (every cell is new); so does copying or moving into
+  a Picture, and `fade()` into one.
+- A Picture can be shown on a different Display or alternate with another Picture; the
+  Display notices a picture it has not seen last and looks at all of it.
+- A Display whose `color`, `fps` or `hash_letters` changes works every letter out again.
+  Set `color` once, before the first frame: cells already on the terminal keep the colour
+  they were drawn in.
+- `#ifdef VTSCREEN_RETAINED` tells a program the library has this.
+
+Without `retain()` nothing changes: no flags are kept and every cell is looked at, as it
+always was (the scenes in vtshow work like this and were not touched). Inside the
+Display the letters the terminal should show (`target`) and what it was last sent
+(`shown`) are kept between frames; a cell of `target` that changes is flagged, and
+sending visits only the flagged cells and rows, so a frame with nothing flagged scans
+nothing.
+
+## Tests
+
+`tests/run_tests.sh` builds `tests/retained_tests.cpp` with the strict warning flags and
+the address and undefined-behaviour sanitizers, and runs it. It checks:
+
+- that the bytes sent are the bytes the library sent before retained mode, on fixed
+  pseudo-random sequences (hashes made with the older library are pinned in the test);
+- that, for 20 000 random frames of every kind of edit (writes, text, `set`, false alarms,
+  shimmer on and off, direct writes with `touch`, copies, swaps, resizes, refreshes, fades,
+  switching pictures, changing `hash_letters` and `fps`), a retained picture and an
+  ordinary one make the Display send identical bytes;
+- that a small model of a terminal, reading those bytes, shows the same screen as
+  `render_plain` (which converts a picture with code of its own) for each frame;
+- that skipping is real (a cell written behind the picture's back is not noticed until
+  it is touched), shimmer is followed without being touched, and copies, moves, serials and
+  the flags behave as described above.
+
+`tests/bench_render.cpp` prints the timings above.
+
 ## Writing a scene
 
 Derive from `vtscreen::Scene` (`info()`, `setup(cols, rows)`, `frame(t, Picture&)`),
