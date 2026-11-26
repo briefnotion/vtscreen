@@ -196,6 +196,20 @@ inline std::string to_utf8(const std::u32string& s) {
 // A text cell (text = true) is different: it is a letter the scene chose itself.
 // The Display draws ch, in inverse video if inv is set, in the colour r, g, b, and
 // ignores lum and shimmer. Text is how the readout in the corner is drawn.
+// What a text cell can be, besides its letter, colours and inverse flag (PicCell::attrs). The terminal draws them: how (and whether) is up
+// to the terminal program. A cell with none of them is drawn as it always was.
+constexpr uint8_t CELL_BOLD = 1;         // bold weight
+constexpr uint8_t CELL_ITALIC = 2;
+constexpr uint8_t CELL_UNDERLINE = 4;    // a plain single underline
+constexpr uint8_t CELL_STRIKE = 8;       // strikethrough
+constexpr uint8_t CELL_BLINK = 16;       // the terminal's own blink
+// A letter that takes two columns (Chinese, an emoji ...) is two cells: the first, with CELL_WIDE and the letter, and the second, with
+// CELL_TAIL, which draws nothing itself (the same colours as the first make it look right). A half of a pair without the other is drawn as a
+// blank, so a picture cut in the middle of one (a slide, a dissolve) is safe.
+constexpr uint8_t CELL_WIDE = 32;
+constexpr uint8_t CELL_TAIL = 64;
+constexpr uint8_t CELL_LOOKS = CELL_BOLD | CELL_ITALIC | CELL_UNDERLINE | CELL_STRIKE | CELL_BLINK;   // the ones the terminal is told about
+
 struct PicCell {
     double lum = 0;
     double r = 0, g = 0, b = 0;
@@ -205,11 +219,12 @@ struct PicCell {
     bool text = false;
     char32_t ch = U' ';
     bool inv = false;
+    uint8_t attrs = 0;                        // CELL_BOLD ... (text cells only)
 
     bool operator==(const PicCell& o) const {
         return lum == o.lum && r == o.r && g == o.g && b == o.b && shimmer == o.shimmer &&
                alt_lum == o.alt_lum && alt_r == o.alt_r && alt_g == o.alt_g && alt_b == o.alt_b &&
-               text == o.text && ch == o.ch && inv == o.inv;
+               text == o.text && ch == o.ch && inv == o.inv && attrs == o.attrs;
     }
     bool operator!=(const PicCell& o) const { return !(*this == o); }
 };
@@ -432,6 +447,18 @@ inline double clampd(double v, double lo, double hi) {
 // a colour channel (0..255) as the nearest whole number, not rounded to colour levels
 inline int byte(double v) { return (int)(clampd(v, 0, 255) + 0.5); }
 
+// the codes that take a terminal's text attributes from `pen` to `want` (only the CELL_LOOKS bits count); pen becomes want's
+inline void sgr_attrs(std::string& out, unsigned char& pen, unsigned char want) {
+    const unsigned char diff = (unsigned char)((pen ^ want) & CELL_LOOKS);
+    if (!diff) return;
+    if (diff & CELL_BOLD) out += (want & CELL_BOLD) ? "\x1b[1m" : "\x1b[22m";
+    if (diff & CELL_ITALIC) out += (want & CELL_ITALIC) ? "\x1b[3m" : "\x1b[23m";
+    if (diff & CELL_UNDERLINE) out += (want & CELL_UNDERLINE) ? "\x1b[4m" : "\x1b[24m";
+    if (diff & CELL_STRIKE) out += (want & CELL_STRIKE) ? "\x1b[9m" : "\x1b[29m";
+    if (diff & CELL_BLINK) out += (want & CELL_BLINK) ? "\x1b[5m" : "\x1b[25m";
+    pen = (unsigned char)((pen & ~CELL_LOOKS) | (want & CELL_LOOKS));
+}
+
 inline bool stdout_is_tty() {
 #ifdef VTSCREEN_WINDOWS
     return _isatty(_fileno(stdout)) != 0;
@@ -485,6 +512,7 @@ inline std::string render_plain(const Picture& F, int R, int C, double t, int fp
     char esc[40];
     for (int i = 0; i < R; i++) {
         int last[3] = {-1, -1, -1};
+        unsigned char pen_attrs = 0;           // bold, italic ... currently on
         bool on = false;                       // inverse video currently on
         bool alt_on = false;                   // a background colour currently set
         int lastalt[3] = {-1, -1, -1};
@@ -492,9 +520,21 @@ inline std::string render_plain(const Picture& F, int R, int C, double t, int fp
             const PicCell& pc = F.cell[i * C + j];
             bool inv;
             char32_t ch;
-            if (pc.text) { ch = pc.ch; inv = pc.inv; }
+            unsigned char attrs = 0;
+            bool wide = false;
+            if (pc.text) {
+                ch = pc.ch; inv = pc.inv; attrs = (unsigned char)(pc.attrs & CELL_LOOKS);
+                if (pc.attrs & CELL_WIDE) {            // two columns: only if its other half is there, otherwise a blank
+                    wide = j + 1 < C && F.cell[i * C + j + 1].text && (F.cell[i * C + j + 1].attrs & CELL_TAIL);
+                    if (!wide) ch = U' ';
+                } else if (pc.attrs & CELL_TAIL) {
+                    ch = U' ';                         // (a tail whose head is there is skipped with it, below: this one is on its own)
+                }
+            }
             else ch = pick_char(pc.lum, i, j, t, fps, inv, hash_letters, pc.shimmer);
             inv = inv && vt_inv;
+            if (!vt_inv) attrs = 0;                    // plain text: no codes at all
+            if (attrs != pen_attrs) detail::sgr_attrs(out, pen_attrs, attrs);
             if (inv != on) { out += inv ? "\x1b[7m" : "\x1b[27m"; on = inv; }
             if (color) {                                  // the alt colour (background)
                 const bool alt = pc.alt_lum > 0;
@@ -514,7 +554,7 @@ inline std::string render_plain(const Picture& F, int R, int C, double t, int fp
                     alt_on = false;
                 }
             }
-            if (ch == U' ' && !inv) { out += ' '; continue; }
+            if (ch == U' ' && !inv && !(attrs & (CELL_UNDERLINE | CELL_STRIKE))) { out += ' '; continue; }
             if (color) {
                 int px[3];
                 if (pc.text) { px[0] = detail::byte(pc.r); px[1] = detail::byte(pc.g); px[2] = detail::byte(pc.b); }
@@ -526,8 +566,9 @@ inline std::string render_plain(const Picture& F, int R, int C, double t, int fp
                 }
             }
             detail::append_utf8(out, ch);
+            if (wide) j++;                                 // its second column is drawn with it
         }
-        if (color || on) out += "\x1b[0m";
+        if (color || on || pen_attrs) out += "\x1b[0m";
         if (erase) out += "\x1b[K";
         out += "\n";
     }
@@ -545,18 +586,23 @@ struct VtCell {
     unsigned char r = 0, g = 0, b = 0;
     bool alt = false;                         // an alt colour is set (see PicCell)
     unsigned char ar = 0, ag = 0, ab = 0;     // it, already scaled by its brightness
+    unsigned char attrs = 0;                  // CELL_BOLD ... (see PicCell)
+    unsigned char pad_[3] = {0, 0, 0};        // always zero: no padding is left to the compiler (checked below)
 
-    // Twelve bytes and no padding (checked below), so equal cells are equal bytes: one compare for all of it.
+    // Sixteen bytes and no hidden padding (checked below), so equal cells are equal bytes: one compare for all of it.
     bool operator==(const VtCell& o) const { return std::memcmp(this, &o, sizeof(VtCell)) == 0; }
     bool operator!=(const VtCell& o) const { return !(*this == o); }
+    // does the cell draw anything beyond its background (a plain space does not)
+    bool visible() const { return ch != U' ' || inv || (attrs & (CELL_UNDERLINE | CELL_STRIKE)); }
 };
-static_assert(sizeof(VtCell) == sizeof(char32_t) + 2 * 4 * sizeof(unsigned char), "VtCell must have no padding");
+static_assert(sizeof(VtCell) == sizeof(char32_t) + 3 * 4 * sizeof(unsigned char), "VtCell must have no hidden padding");
 
 inline VtCell make_cell(char32_t ch, bool inv, int r, int g, int b, bool alt = false,
-                        int ar = 0, int ag = 0, int ab = 0) {
-    if (ch == U' ' && !inv) r = g = b = 0;     // a plain space has no visible letter colour
+                        int ar = 0, int ag = 0, int ab = 0, unsigned char attrs = 0) {
+    // a plain space has no visible letter colour (one that is underlined or struck through has)
+    if (ch == U' ' && !inv && !(attrs & (CELL_UNDERLINE | CELL_STRIKE))) r = g = b = 0;
     VtCell k;
-    k.ch = ch; k.inv = inv;
+    k.ch = ch; k.inv = inv; k.attrs = attrs;
     k.r = (unsigned char)r; k.g = (unsigned char)g; k.b = (unsigned char)b;
     if (alt) {
         k.alt = true;
@@ -571,8 +617,8 @@ struct VtScreen {
 
     void init(int R, int C) { rows = R; cols = C; cell.assign((size_t)R * C, VtCell()); }
     void set(int i, int j, char32_t ch, bool inv, int r, int g, int b, bool alt = false,
-             int ar = 0, int ag = 0, int ab = 0) {
-        cell[(size_t)i * cols + j] = make_cell(ch, inv, r, g, b, alt, ar, ag, ab);
+             int ar = 0, int ag = 0, int ab = 0, unsigned char attrs = 0) {
+        cell[(size_t)i * cols + j] = make_cell(ch, inv, r, g, b, alt, ar, ag, ab, attrs);
     }
     const VtCell& at(int i, int j) const { return cell[(size_t)i * cols + j]; }
 };
@@ -713,7 +759,7 @@ public:
                 }
             }
         }
-        pen_inv = 0; pr = pg = pb = -1; pen_alt = false; par = pag = pab = -1;
+        pen_inv = 0; pr = pg = pb = -1; pen_alt = false; par = pag = pab = -1; pen_attrs = 0;
         cur_r = cur_c = -1;
         return "\x1b[0m\x1b[H\x1b[2J";
     }
@@ -998,6 +1044,7 @@ private:
     int last_fps_ = 30;
     uint64_t last_serial_ = 0;                    // the Picture it was done for
     int pen_inv = 0, pr = -1, pg = -1, pb = -1;   // what the terminal will use next
+    unsigned char pen_attrs = 0;                  // ... its text attributes (CELL_BOLD ...)
     bool pen_alt = false;                         // ... and its background colour (none, or
     int par = -1, pag = -1, pab = -1;             //     this one)
     int cur_r = -1, cur_c = -1;                   // where its cursor is (-1: unknown)
@@ -1009,7 +1056,7 @@ private:
         if (pc.text) {                  // a letter the scene chose: as it is
             out = make_cell(pc.ch, pc.inv, detail::byte(pc.r), detail::byte(pc.g),
                             detail::byte(pc.b), alt, detail::byte(pc.alt_r * al),
-                            detail::byte(pc.alt_g * al), detail::byte(pc.alt_b * al));
+                            detail::byte(pc.alt_g * al), detail::byte(pc.alt_b * al), pc.attrs);
             return;
         }
         bool inv;
@@ -1050,7 +1097,14 @@ private:
                 if (partial && !F.touched[idx] && !F.animated[idx]) continue;
                 VtCell k;
                 letter(src[idx], i, j, t, k);
-                if (tgt[idx] != k) { tgt[idx] = k; chg[idx] = 1; row_chg[i] = 1; any = true; }
+                if (tgt[idx] != k) {
+                    // a half of a wide letter: what the other half draws depends on this one, so look at it again when sending
+                    if (((tgt[idx].attrs | k.attrs) & (CELL_WIDE | CELL_TAIL)) != 0) {
+                        if (j > 0) chg[idx - 1] = 1;
+                        if (j + 1 < C) chg[idx + 1] = 1;
+                    }
+                    tgt[idx] = k; chg[idx] = 1; row_chg[i] = 1; any = true;
+                }
                 if (retained) {
                     const bool moves = !src[idx].text && src[idx].shimmer > 0;     // does its letter change with time
                     if (moves != (F.animated[idx] != 0)) {
@@ -1066,12 +1120,86 @@ private:
         last_serial_ = F.serial;
     }
 
+    // The cell as it is drawn: the target's, except that half of a wide letter without its other half is a blank (keeping its background).
+    VtCell drawn(int i, int j) const {
+        VtCell k = target.at(i, j);
+        bool ok = true;
+        if (k.attrs & CELL_WIDE) ok = j + 1 < target.cols && (target.at(i, j + 1).attrs & CELL_TAIL) != 0;
+        else if (k.attrs & CELL_TAIL) ok = j > 0 && (target.at(i, j - 1).attrs & CELL_WIDE) != 0 && !(target.at(i, j - 1).attrs & CELL_TAIL);
+        if (!ok) k = make_cell(U' ', false, 0, 0, 0, k.alt, k.ar, k.ag, k.ab);
+        return k;
+    }
+
+    // write cell k at row i, column j (the terminal's cursor and pens are moved as needed), and note it as shown
+    void put(std::string& out, int i, int j, const VtCell& k) {
+        char esc[40];
+        const size_t idx = (size_t)i * shown.cols + j;
+        const int cols = shown.cols;
+        // A short gap of unchanged cells is cheaper to write again than to
+        // skip with a cursor move, when no colour or inverse code is needed.
+        if (cur_r == i && cur_c >= 0 && j >= cur_c && j - cur_c <= 3) {
+            bool free = true;
+            for (int x = cur_c; x < j && free; x++) {
+                const VtCell& u = shown.at(i, x);
+                free = !(u.attrs & (CELL_WIDE | CELL_TAIL)) &&
+                       (int)u.inv == pen_inv &&
+                       (u.attrs & CELL_LOOKS) == pen_attrs &&
+                       (!u.visible() || !color || (pr == u.r && pg == u.g && pb == u.b)) &&
+                       (!color || (u.alt ? pen_alt && par == u.ar && pag == u.ag && pab == u.ab
+                                         : !pen_alt));
+            }
+            if (free) {
+                for (int x = cur_c; x < j; x++) detail::append_utf8(out, shown.at(i, x).ch);
+                cur_c = j;
+            }
+        }
+        if (cur_r == i && cur_c == j) {}
+        else if (cur_r == i && cur_c >= 0 && cur_c < j) {
+            int g = j - cur_c;
+            if (g == 1) out += "\x1b[C";
+            else { std::snprintf(esc, sizeof esc, "\x1b[%dC", g); out += esc; }
+        } else {
+            std::snprintf(esc, sizeof esc, "\x1b[%d;%dH", i + 1, j + 1);
+            out += esc;
+        }
+        if (pen_inv != (int)k.inv) { out += k.inv ? "\x1b[7m" : "\x1b[27m"; pen_inv = k.inv; }
+        if ((k.attrs & CELL_LOOKS) != pen_attrs) detail::sgr_attrs(out, pen_attrs, k.attrs);
+        if (color) {
+            if (k.alt) {
+                if (!pen_alt || par != k.ar || pag != k.ag || pab != k.ab) {
+                    std::snprintf(esc, sizeof esc, "\x1b[48;2;%d;%d;%dm", k.ar, k.ag, k.ab);
+                    out += esc;
+                    pen_alt = true; par = k.ar; pag = k.ag; pab = k.ab;
+                }
+            } else if (pen_alt) {
+                out += "\x1b[49m";
+                pen_alt = false;
+            }
+        }
+        if (color && k.visible() && (pr != k.r || pg != k.g || pb != k.b)) {
+            std::snprintf(esc, sizeof esc, "\x1b[38;2;%d;%d;%dm", k.r, k.g, k.b);
+            out += esc;
+            pr = k.r; pg = k.g; pb = k.b;
+        }
+        detail::append_utf8(out, (k.attrs & CELL_TAIL) ? U' ' : k.ch);
+        shown.cell[idx] = k;
+        if (k.attrs & CELL_WIDE) {
+            // it takes two columns: its second half is shown with it. Where the terminal's cursor is now is not trusted (terminals differ on
+            // how wide some letters are), so the next write moves it for certain.
+            shown.cell[idx + 1] = drawn(i, j + 1);
+            changed_[idx + 1] = 0;
+            cur_r = cur_c = -1;
+        } else {
+            cur_r = i; cur_c = j + 1;
+            if (cur_c >= cols) cur_r = cur_c = -1;   // pending wrap: position unknown
+        }
+    }
+
     // compare the flagged cells of target with shown and write the differences
     std::string send() {
         std::string out;
         if (!any_changed_) return out;                  // nothing is flagged: nothing to look at, nothing to send
         const int rows = shown.rows, cols = shown.cols;
-        char esc[40];
         for (int i = 0; i < rows; i++) {
             if (!row_changed_[(size_t)i]) continue;
             row_changed_[(size_t)i] = 0;
@@ -1079,57 +1207,14 @@ private:
                 const size_t idx = (size_t)i * cols + j;
                 if (!changed_[idx]) continue;
                 changed_[idx] = 0;
-                const VtCell k = target.at(i, j);
-                VtCell& sh = shown.cell[idx];
-                if (k == sh) continue;
-                // A short gap of unchanged cells is cheaper to write again than to
-                // skip with a cursor move, when no colour or inverse code is needed.
-                if (cur_r == i && cur_c >= 0 && j >= cur_c && j - cur_c <= 3) {
-                    bool free = true;
-                    for (int x = cur_c; x < j && free; x++) {
-                        const VtCell& u = shown.at(i, x);
-                        bool plain = u.ch == U' ' && !u.inv;
-                        free = (int)u.inv == pen_inv &&
-                               (plain || !color || (pr == u.r && pg == u.g && pb == u.b)) &&
-                               (!color || (u.alt ? pen_alt && par == u.ar && pag == u.ag && pab == u.ab
-                                                 : !pen_alt));
-                    }
-                    if (free) {
-                        for (int x = cur_c; x < j; x++) detail::append_utf8(out, shown.at(i, x).ch);
-                        cur_c = j;
-                    }
+                const VtCell k = drawn(i, j);
+                if (k == shown.cell[idx]) continue;
+                if ((k.attrs & CELL_TAIL) && j > 0) {
+                    // the second half of a wide letter changed and its first half did not: the first half draws both, so draw it again
+                    put(out, i, j - 1, drawn(i, j - 1));
+                    continue;
                 }
-                if (cur_r == i && cur_c == j) {}
-                else if (cur_r == i && cur_c >= 0 && cur_c < j) {
-                    int g = j - cur_c;
-                    if (g == 1) out += "\x1b[C";
-                    else { std::snprintf(esc, sizeof esc, "\x1b[%dC", g); out += esc; }
-                } else {
-                    std::snprintf(esc, sizeof esc, "\x1b[%d;%dH", i + 1, j + 1);
-                    out += esc;
-                }
-                if (pen_inv != (int)k.inv) { out += k.inv ? "\x1b[7m" : "\x1b[27m"; pen_inv = k.inv; }
-                if (color) {
-                    if (k.alt) {
-                        if (!pen_alt || par != k.ar || pag != k.ag || pab != k.ab) {
-                            std::snprintf(esc, sizeof esc, "\x1b[48;2;%d;%d;%dm", k.ar, k.ag, k.ab);
-                            out += esc;
-                            pen_alt = true; par = k.ar; pag = k.ag; pab = k.ab;
-                        }
-                    } else if (pen_alt) {
-                        out += "\x1b[49m";
-                        pen_alt = false;
-                    }
-                }
-                if (color && !(k.ch == U' ' && !k.inv) && (pr != k.r || pg != k.g || pb != k.b)) {
-                    std::snprintf(esc, sizeof esc, "\x1b[38;2;%d;%d;%dm", k.r, k.g, k.b);
-                    out += esc;
-                    pr = k.r; pg = k.g; pb = k.b;
-                }
-                detail::append_utf8(out, k.ch);
-                sh = k;
-                cur_r = i; cur_c = j + 1;
-                if (cur_c >= cols) cur_r = cur_c = -1;   // pending wrap: position unknown
+                put(out, i, j, k);
             }
         }
         any_changed_ = false;

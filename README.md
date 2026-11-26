@@ -77,6 +77,7 @@ scene fills in, for each cell:
 | `shimmer` | how fast the cell's letter rotates inside its brightness group: 1 (the default) is the normal rate, 2 is twice as fast, and 0 shows the first letter of the group in every such cell (no scatter, no rotation), so a cell that must hold still, and look the same as its neighbours, uses 0. Any value above 0, however small, shows the varied letters, only very slowly. A star could use 0.2 for a slow twinkle and an ember 3. A cell cannot change letter more than once a frame, so at 30 fps nothing above about 2.5 looks different |
 | `alt_lum`, `alt_r`, `alt_g`, `alt_b` | the alt colour, the other colour of the pair: brightness 0 to 1 and colour 0 to 255. See below. The default, `alt_lum = 0`, means none |
 | `text`, `ch`, `inv` | a letter the scene chooses itself: when `text` is set the cell is drawn as the character `ch` (inverse video if `inv`) in the colour `r`, `g`, `b`, and `lum` and `shimmer` are ignored |
+| `attrs` | for a text cell, any of `CELL_BOLD`, `CELL_ITALIC`, `CELL_UNDERLINE`, `CELL_STRIKE`, `CELL_BLINK` added together (`|`), and `CELL_WIDE` / `CELL_TAIL` for a wide letter (see below). Default 0: drawn as before |
 
 `shimmer` only chooses which letter of the group shows. For a cell that dims and
 brightens, the scene also varies `lum`. `init()` resets every cell to the defaults
@@ -98,9 +99,26 @@ scene lacks fades toward none.
 **Text.** `F.text(row, col, "flame 2.2 m")` writes a string as text cells, in the readout
 grey unless you give a colour: `F.text(row, col, s, r, g, b, inv)`. The scenes use it
 for the readout in the top-left corner. Text is UTF-8 and each cell holds one Unicode
-character (`char32_t`), so `°`, `─` or `█` work. Every character is taken to be one
-column wide: wide characters (Chinese, emoji) and combining marks are not handled. On
-Windows the console is switched to UTF-8 while the program runs.
+character (`char32_t`), so `°`, `─` or `█` work. A character is taken to be one column wide
+(combining marks are not handled), except where you say otherwise (below). On Windows the
+console is switched to UTF-8 while the program runs.
+
+**Attributes.** A text cell can be bold, italic, underlined, struck through or blinking:
+`PicCell c; c.text = true; c.ch = U'x'; c.attrs = CELL_BOLD | CELL_UNDERLINE;`. The Display tells
+the terminal with the usual codes (`ESC[1m`, `3m`, `4m`, `9m`, `5m` and the matching offs), only when
+they change from one cell to the next. How a terminal draws them, or whether it does, is up to the
+terminal program (blink in particular is often off). An underlined or struck-through space is
+drawn in the cell's colour; any other space has no colour, as before. A cell with no attributes is
+drawn exactly as it always was, and a program that uses none sends the same bytes as before.
+
+**Wide characters.** A letter that takes two columns is two cells in the picture: the first has
+`CELL_WIDE` and the letter, the second has `CELL_TAIL` (and the same colours, so a pair is drawn with
+one pen). The Display writes the first, which fills both columns, and skips the second; after it the
+terminal's cursor is moved explicitly, since terminals disagree about how wide some letters are. You
+must set `CELL_WIDE` only on a letter the terminal draws two columns wide (you know the width: the
+library does not have a table). A half of a pair without the other (a pair cut by the edge of the
+picture, or in the last column, or a picture mixed from two) is drawn as a blank, so mixing pictures
+cell by cell is safe.
 
 **The status bar.** `Display::bar(picture, info, t, loop, suffix)` writes the default
 bar into the bottom row as text cells: the scene's title (and the suffix, which `show`
@@ -174,6 +192,12 @@ the address and undefined-behaviour sanitizers, and runs it. It checks:
 - that skipping is real (a cell written behind the picture's back is not noticed until
   it is touched), shimmer is followed without being touched, and copies, moves, serials and
   the flags behave as described above.
+
+`tests/attr_tests.cpp` (run by the same script) checks attributes and wide letters with a model of a
+terminal: the codes sent, nothing sent when nothing changed, underlined spaces, pairs drawn and
+redrawn when only one half changes, halves without a partner shown as blanks, `render_plain`, fades,
+and 16 000 random frames (retained and ordinary pictures, terminals that do and do not blank the
+other half of a wide letter written over) against what the pictures say.
 
 `tests/bench_render.cpp` prints the timings above.
 
