@@ -10,8 +10,11 @@ g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sa
     -o "$OUT/attr_tests" attr_tests.cpp
 g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
     -o "$OUT/image_tests" image_tests.cpp
+g++ -std=c++17 -O1 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fno-sanitize-recover=undefined \
+    -o "$OUT/sixel_tests" sixel_tests.cpp
 "$OUT/retained_tests"
 "$OUT/attr_tests"
 "$OUT/image_tests"
-rm -f "$OUT/retained_tests" "$OUT/attr_tests" "$OUT/image_tests"
+"$OUT/sixel_tests"
+rm -f "$OUT/retained_tests" "$OUT/attr_tests" "$OUT/image_tests" "$OUT/sixel_tests"
 rmdir "$OUT"

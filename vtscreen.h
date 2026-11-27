@@ -51,6 +51,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
@@ -968,6 +969,166 @@ inline std::string sixel_encode(const Pixel* base, int stride, int w, int h) {
 }
 
 }  // namespace detail
+
+// ---------------------------------------------------------------- reading Sixel
+//
+// sixel_decode makes a Raster from the data of a Sixel picture: what follows "ESC P Ps ; Ps ; Ps q", up to the string terminator.
+//
+// What it understands: colours chosen (#n) and defined (#n;2;r;g;b in percent, #n;1;h;l;s as hue, lightness, saturation), the
+// repeat (!n and a letter), the carriage return ($) and the new line (-) of the graphics cursor, the raster attributes
+// ("Pan;Pad;Ph;Pv: the pixel's shape and the size of the picture), and the sixteen colours a VT340 starts with. What it does
+// not understand it skips. The pixel shape is made true by repeating rows or columns (a 2:1 pixel becomes two rows).
+// p2 is the second parameter of the DCS: 1 leaves the pixels the data does not draw transparent (a of 0), any other value fills
+// them with the colour of register 0.
+struct SixelLimits {
+    int max_width = 4096, max_height = 4096;   // a picture wider or taller than this is cut off there
+    int colours = 256;                         // registers; a number past the last wraps round
+};
+
+inline bool sixel_decode(std::string_view data, int p2, Raster& out, const SixelLimits& limits = SixelLimits()) {
+    const int max_w = std::max(1, limits.max_width), max_h = std::max(1, limits.max_height);
+    const int ncolours = std::max(1, std::min(limits.colours, 1024));
+
+    // the colour registers: the VT340's sixteen to start with (in percent), the rest black
+    static const int vt340[16][3] = {{0, 0, 0}, {20, 20, 80}, {80, 13, 13}, {20, 80, 20}, {80, 20, 80}, {20, 80, 80}, {80, 80, 20}, {53, 53, 53},
+                                     {26, 26, 26}, {33, 33, 60}, {60, 26, 26}, {33, 60, 33}, {60, 33, 60}, {33, 60, 60}, {60, 60, 33}, {80, 80, 80}};
+    std::vector<Pixel> palette((size_t)ncolours, Pixel{0, 0, 0, 255});
+    for (int i = 0; i < 16 && i < ncolours; i++)
+        palette[(size_t)i] = Pixel{(uint8_t)(vt340[i][0] * 255 / 100), (uint8_t)(vt340[i][1] * 255 / 100), (uint8_t)(vt340[i][2] * 255 / 100), 255};
+
+    // the picture as it grows: rows of cap_w pixels
+    int cap_w = 0, cap_h = 0;                  // what the buffer holds now
+    std::vector<Pixel> canvas;
+    int width = 0, height = 0;                 // what has been drawn on (width counts every column a sixel was given, drawn or not)
+    int declared_w = 0, declared_h = 0, pan = 1, pad = 1;
+
+    auto ensure = [&](int w, int h) {          // room for w columns and h rows (never more than the limits)
+        w = std::min(w, max_w); h = std::min(h, max_h);
+        if (w <= cap_w && h <= cap_h) return;
+        const int nw = std::min(max_w, std::max(w, cap_w == 0 ? 0 : std::min(max_w, cap_w * 2)));
+        const int nh = std::min(max_h, std::max(h, cap_h == 0 ? 0 : std::min(max_h, cap_h * 2)));
+        std::vector<Pixel> grown((size_t)nw * nh, Pixel());
+        for (int y = 0; y < cap_h; y++) std::copy(canvas.begin() + (std::ptrdiff_t)y * cap_w, canvas.begin() + (std::ptrdiff_t)y * cap_w + cap_w, grown.begin() + (std::ptrdiff_t)y * nw);
+        canvas.swap(grown);
+        cap_w = nw; cap_h = nh;
+    };
+
+    auto number = [&](size_t& i, long cap) {   // digits at i (none: -1), held to cap
+        long v = -1;
+        while (i < data.size() && data[i] >= '0' && data[i] <= '9') { v = (v < 0 ? 0 : v) * 10 + (data[i] - '0'); if (v > cap) v = cap; i++; }
+        return (int)v;
+    };
+
+    auto from_hls = [](int h, int l, int s) {  // the DEC hue puts blue at 0, red at 120, green at 240
+        const double hh = std::fmod((double)h + 240.0, 360.0) / 360.0, ll = std::min(std::max(l, 0), 100) / 100.0, ss = std::min(std::max(s, 0), 100) / 100.0;
+        const double q = ll < 0.5 ? ll * (1 + ss) : ll + ss - ll * ss, p = 2 * ll - q;
+        auto channel = [&](double t) {
+            if (t < 0) t += 1;
+            if (t > 1) t -= 1;
+            double v = t < 1.0 / 6 ? p + (q - p) * 6 * t : t < 0.5 ? q : t < 2.0 / 3 ? p + (q - p) * (2.0 / 3 - t) * 6 : p;
+            return (uint8_t)std::lround(std::min(std::max(v, 0.0), 1.0) * 255);
+        };
+        return Pixel{channel(hh + 1.0 / 3), channel(hh), channel(hh - 1.0 / 3), 255};
+    };
+
+    int colour = 0, x = 0, band = 0;           // the current register, the graphics cursor's column, and its band (rows 6 * band ...)
+    size_t i = 0;
+    while (i < data.size()) {
+        const char c = data[i];
+        if (c == '#') {
+            i++;
+            const int idx = number(i, 65535);
+            if (idx < 0) continue;
+            if (i < data.size() && data[i] == ';') {                           // a definition: Pu ; Px ; Py ; Pz
+                int v[4] = {-1, -1, -1, -1};
+                for (int k = 0; k < 4 && i < data.size() && data[i] == ';'; k++) { i++; v[k] = number(i, 100000); }
+                const size_t reg = (size_t)(idx % ncolours);
+                if (v[0] == 2) palette[reg] = Pixel{(uint8_t)(std::min(std::max(v[1], 0), 100) * 255 / 100), (uint8_t)(std::min(std::max(v[2], 0), 100) * 255 / 100),
+                                                    (uint8_t)(std::min(std::max(v[3], 0), 100) * 255 / 100), 255};
+                else if (v[0] == 1) palette[reg] = from_hls(v[1], v[2], v[3]);
+            }
+            colour = idx % ncolours;
+        } else if (c == '"') {                                                 // raster attributes: Pan ; Pad ; Ph ; Pv
+            i++;
+            int v[4] = {-1, -1, -1, -1};
+            v[0] = number(i, 65535);
+            for (int k = 1; k < 4 && i < data.size() && data[i] == ';'; k++) { i++; v[k] = number(i, 65535); }
+            if (v[0] > 0 && v[1] > 0) { pan = v[0]; pad = v[1]; }
+            if (v[2] > 0 && v[3] > 0) { declared_w = v[2]; declared_h = v[3]; }
+        } else if (c == '!') {                                                 // a letter, repeated
+            i++;
+            int n = number(i, 1 << 24);
+            if (n <= 0) n = 1;                                                 // (a count of 0 means once, as in xterm)
+            if (i >= data.size()) break;
+            const char ch = data[i];
+            if (ch < '?' || ch > '~') continue;                                // a repeat of nothing
+            i++;
+            const int bits = ch - '?';
+            const int span = std::max(0, std::min(n, max_w - x));              // what is left of the width
+            if (span > 0) {
+                width = std::max(width, x + span);
+                if (bits != 0 && 6 * band < max_h) {
+                    ensure(x + span, std::min(max_h, 6 * band + 6));
+                    for (int k = 0; k < 6; k++) {
+                        if (!(bits >> k & 1) || 6 * band + k >= max_h) continue;
+                        Pixel* row = &canvas[(size_t)(6 * band + k) * cap_w];
+                        for (int xx = x; xx < x + span; xx++) row[xx] = palette[(size_t)colour];
+                    }
+                    height = std::max(height, std::min(max_h, 6 * band + 6));
+                }
+            }
+            x = std::min(max_w, x + n);
+        } else if (c >= '?' && c <= '~') {                                     // one sixel: six pixels in a column
+            i++;
+            const int bits = c - '?';
+            if (x < max_w) {
+                width = std::max(width, x + 1);
+                if (bits != 0 && 6 * band < max_h) {
+                    ensure(x + 1, std::min(max_h, 6 * band + 6));
+                    for (int k = 0; k < 6; k++)
+                        if ((bits >> k & 1) && 6 * band + k < max_h) canvas[(size_t)(6 * band + k) * cap_w + x] = palette[(size_t)colour];
+                    height = std::max(height, std::min(max_h, 6 * band + 6));
+                }
+            }
+            x = std::min(max_w, x + 1);
+        } else if (c == '$') { x = 0; i++; }
+        else if (c == '-') { x = 0; band = std::min(band + 1, max_h / 6 + 1); i++; }     // (held, so a flood of new lines cannot overflow)
+        else i++;                                                              // anything else is skipped
+    }
+
+    // the size: what the picture says it is, if it says (never beyond the limits), else what was drawn
+    int w = declared_w > 0 ? std::min(declared_w, max_w) : width;
+    int h = declared_h > 0 ? std::min(declared_h, max_h) : height;
+    if (declared_w > 0 && declared_h <= 0) h = height;
+    if (w <= 0 || h <= 0) { out.init(0, 0); return false; }
+
+    // the picture, in rows of w pixels; what was not drawn is transparent, or register 0's colour
+    Raster r;
+    r.init(w, h);
+    const Pixel background = p2 == 1 ? Pixel() : palette[0];
+    for (int y = 0; y < h; y++)
+        for (int xx = 0; xx < w; xx++) {
+            const bool inside = y < cap_h && xx < cap_w;
+            const Pixel& p = inside ? canvas[(size_t)y * cap_w + xx] : background;
+            r.at(xx, y) = (inside && p.a == 0) ? background : p;
+        }
+
+    // a pixel that is not square: repeat rows (tall pixels) or columns (wide ones)
+    int rep_x = 1, rep_y = 1;
+    if (pan > pad) rep_y = std::max(1, (int)std::lround((double)pan / pad));
+    else if (pad > pan) rep_x = std::max(1, (int)std::lround((double)pad / pan));
+    rep_x = std::min(rep_x, std::max(1, max_w / w));
+    rep_y = std::min(rep_y, std::max(1, max_h / h));
+    if (rep_x > 1 || rep_y > 1) {
+        Raster big;
+        big.init(w * rep_x, h * rep_y);
+        for (int y = 0; y < big.h; y++)
+            for (int xx = 0; xx < big.w; xx++) big.at(xx, y) = r.at(xx / rep_x, y / rep_y);
+        r = std::move(big);
+    }
+    out = std::move(r);
+    return true;
+}
 
 // ---------------------------------------------------------------- the display: pictures onto the terminal
 //
