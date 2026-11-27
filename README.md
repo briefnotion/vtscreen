@@ -196,8 +196,10 @@ the terminal): `vtscreen::set_image_support(cell_w, cell_h)` before the Display 
 use it), or `display.enable_images(cell_w, cell_h)`. Until then pictures are ignored and the output is exactly what it was
 without them (the tests check this byte for byte). `VTSCREEN_IMAGES` is defined when the library has them. The Display
 draws them after the letters, sends only the cells whose pixels changed (neighbours in a row as one picture), keeps them
-out of the status bar's row, and does nothing with them under `--no-color`. `fade()` takes the pictures of the picture
-that is ahead, like text. `detail::sixel_encode` is the encoder (up to 255 colours; with more, the most used are kept).
+out of the status bar's row, and does nothing with them under `--no-color`. `fade()` dissolves them: each picture thins out by the share
+it is not ahead by (a fixed order per pixel, so the pixels that go first come back last), a's under b's, and nested fades
+each dissolve in an order of their own so the shares multiply. Pixels cannot be mixed like colours, and a pop at the
+halfway point looked wrong next to letters that cross-fade. `detail::sixel_encode` is the encoder (up to 255 colours; with more, the most used are kept).
 
 **What a terminal does with letters over pixels** (measured in Windows Terminal): writing a letter into a cell takes that
 cell's pixels with it. So whenever a letter under a picture is written, that cell's pixels are sent again, which costs a

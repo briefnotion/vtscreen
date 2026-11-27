@@ -321,6 +321,10 @@ struct Picture {
     bool retained = false;                    // see above
     uint64_t serial = detail::next_picture_serial();
 
+    // How many fades deep this picture is (fade() sets it): a picture made by fading pictures that were made by fading is one
+    // deeper, so each level dissolves the pictures made of pixels in an order of its own and the shares multiply.
+    uint32_t fade_level = 0;
+
     // Pictures made of pixels, drawn over the letters in this order (see Raster). The Raster is
     // looked at when the picture is shown, so a scene can keep one and change it between frames.
     std::vector<ImagePlacement> images;
@@ -338,16 +342,16 @@ struct Picture {
 
     Picture() = default;
     // A copy has a number of its own, and every cell of it is new.
-    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained), images(o.images) {}
+    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained), fade_level(o.fade_level), images(o.images) {}
     Picture& operator=(const Picture& o) {
-        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; images = o.images; forget_flags(); }
+        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; fade_level = o.fade_level; images = o.images; forget_flags(); }
         return *this;
     }
     Picture(Picture&& o) noexcept
-        : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained), images(std::move(o.images)) { o.forget_flags(); }
+        : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained), fade_level(o.fade_level), images(std::move(o.images)) { o.forget_flags(); }
     Picture& operator=(Picture&& o) noexcept {
         if (this != &o) {
-            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained; images = std::move(o.images);
+            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained; fade_level = o.fade_level; images = std::move(o.images);
             forget_flags(); o.forget_flags();
         }
         return *this;
@@ -360,6 +364,7 @@ struct Picture {
         rows = R + 1; cols = C;
         cell.assign((size_t)(R + 1) * C, PicCell());
         images.clear();                           // starting over: no pictures made of pixels either
+        fade_level = 0;
         forget_flags();
     }
     int bar_row() const { return rows - 1; }
@@ -460,19 +465,61 @@ public:
 
 // ---------------------------------------------------------------- mixing two pictures
 
+namespace detail {
+inline uint32_t pixel_hash(int x, int y, uint32_t seed) {
+    uint32_t h = ((uint32_t)x * 0x9E3779B1u) ^ (((uint32_t)y + 0x7F4A7C15u) * 0x85EBCA77u) ^ (seed * 0xC2B2AE3Du);
+    h ^= h >> 15; h *= 0x2C1B3C6Du; h ^= h >> 12; h *= 0x297A2D39u; h ^= h >> 15;
+    return h;
+}
+
+// A picture made of pixels, thinned to the fraction keep (0 to 1) of its pixels. Each pixel has a place of its own in a fixed
+// order (a hash of where it is and `seed`, which tells pictures apart), and the ones kept are the first keep of them: as keep
+// goes up, the pixels that were there stay and more come, and as it goes down, the same ones go last. That makes a fade a
+// dissolve. A keep of 1 gives the picture itself, and of 0 or less nothing (an empty placement, with no raster).
+inline ImagePlacement thinned(const ImagePlacement& p, double keep, uint32_t seed) {
+    if (!p.raster || keep <= 0.0) return ImagePlacement();
+    if (keep >= 1.0) return p;
+    auto r = std::make_shared<Raster>(*p.raster);
+    const uint32_t limit = (uint32_t)(keep * 4294967295.0);
+    for (int y = 0; y < r->h; y++)
+        for (int x = 0; x < r->w; x++) {
+            Pixel& q = r->at(x, y);
+            if (q.a != 0 && pixel_hash(x, y, seed) >= limit) q = Pixel();
+        }
+    ImagePlacement out = p;
+    out.raster = std::move(r);
+    return out;
+}
+}  // namespace detail
+
 // Mix two pictures of the same size into out: pct 0 gives a, 1 gives b, in
 // between is a cross-fade. Brightness, colour and shimmer are mixed cell by cell,
 // before any letters are picked, so the Display picks the letters once for the
 // mixture. Text cannot be mixed, so a cell that is text in either picture takes
 // the letter from the picture that is ahead (a up to the halfway point, b after
 // it). If both are text the colours are mixed as well; if only one is, the cell
-// is that picture's cell as it is.
+// is that picture's cell as it is. The pictures made of pixels (Picture::place_image) dissolve:
+// each thins out by the share it is not ahead by, the pixels that go first coming back last, with
+// a's under b's (a picture whose weight is 1 is used as it is, one of 0 is left out).
 inline void fade(const Picture& a, const Picture& b, double pct, Picture& out) {
     pct = pct < 0 ? 0 : (pct > 1 ? 1 : pct);
     const double wa = 1.0 - pct, wb = pct;
     out.rows = a.rows; out.cols = a.cols;
     out.cell.resize(a.cell.size());
-    out.images = pct < 0.5 ? a.images : b.images;     // pixels cannot be mixed: they go with the picture that is ahead, like text
+    {   // pixels cannot be mixed either, so the pictures dissolve: each thins out by the share it is not ahead by (a under b)
+        std::vector<ImagePlacement> mixed_images;
+        const uint32_t level = std::max(a.fade_level, b.fade_level) + 1;          // a deeper fade dissolves in an order of its own
+        for (size_t k = 0; k < a.images.size(); k++) {
+            ImagePlacement t = detail::thinned(a.images[k], wa, level * 100003u + 1000u + (uint32_t)k);
+            if (t.raster) mixed_images.push_back(std::move(t));
+        }
+        for (size_t k = 0; k < b.images.size(); k++) {
+            ImagePlacement t = detail::thinned(b.images[k], wb, level * 100003u + 2000u + (uint32_t)k);
+            if (t.raster) mixed_images.push_back(std::move(t));
+        }
+        out.images = std::move(mixed_images);
+        out.fade_level = level;
+    }
     out.touch_all();                          // every cell is written below
     for (size_t i = 0; i < a.cell.size(); i++) {
         const PicCell& p = a.cell[i];

@@ -350,14 +350,106 @@ int main() {
         fresh.place_image(r, 1, 1);
         fresh.init(5, 10);
         CHECK(fresh.images.empty());
-        // A fade takes the pictures of the picture that is ahead.
-        Picture x, y, out;
-        x.init(10, 20); y.init(10, 20);
-        x.place_image(r, 1, 1);
-        fade(x, y, 0.3, out);
-        CHECK(out.images.size() == 1);
-        fade(x, y, 0.7, out);
-        CHECK(out.images.empty());
+        // A fade dissolves the pictures: 0 is a's, 1 is b's, in between each is thinned by the share it is not ahead by.
+        {
+            auto solid = [](int w, int h, int r, int g, int b) {
+                auto ras = std::make_shared<Raster>();
+                ras->init(w, h);
+                for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) ras->set(x, y, r, g, b);
+                return ras;
+            };
+            auto count = [](const ImagePlacement& ip) { long n = 0; for (const Pixel& px : ip.raster->px) n += px.a != 0; return n; };
+            auto ra = solid(40, 30, 200, 0, 0), rb = solid(40, 30, 0, 0, 200);
+            Picture x, y, out;
+            x.init(10, 20); y.init(10, 20);
+            x.place_image(ra, 1, 1);
+            y.place_image(rb, 2, 2);
+            fade(x, y, 0.0, out);
+            CHECK(out.images.size() == 1 && out.images[0].raster == ra && out.images[0].row == 1 && out.images[0].col == 1);   // a itself
+            fade(x, y, 1.0, out);
+            CHECK(out.images.size() == 1 && out.images[0].raster == rb && out.images[0].row == 2 && out.images[0].col == 2);   // b itself
+            fade(x, y, 0.5, out);
+            CHECK(out.images.size() == 2);                                   // both are there, thinned
+            if (out.images.size() == 2) {
+                CHECK(count(out.images[0]) > 540 && count(out.images[0]) < 660);        // about half of 1200 each
+                CHECK(count(out.images[1]) > 540 && count(out.images[1]) < 660);
+                CHECK(out.images[0].row == 1 && out.images[1].row == 2);                  // a under b
+            }
+            fade(x, y, 0.25, out);
+            if (out.images.size() == 2) CHECK(count(out.images[0]) > 810 && count(out.images[0]) < 990 && count(out.images[1]) > 210 && count(out.images[1]) < 390);
+            // What is kept only grows for the picture coming in and only shrinks for the one going out, pixel by pixel; colours are kept.
+            Picture lo, hi;
+            fade(x, y, 0.3, lo);
+            fade(x, y, 0.6, hi);
+            if (lo.images.size() == 2 && hi.images.size() == 2) {
+                int bad = 0;
+                for (size_t k = 0; k < ra->px.size(); k++) {
+                    if (hi.images[0].raster->px[k].a != 0 && lo.images[0].raster->px[k].a == 0) bad++;      // a: what is there later was there before
+                    if (lo.images[1].raster->px[k].a != 0 && hi.images[1].raster->px[k].a == 0) bad++;      // b: what was there before is still there
+                    if (lo.images[0].raster->px[k].a != 0 && lo.images[0].raster->px[k] != ra->px[k]) bad++;
+                    if (hi.images[1].raster->px[k].a != 0 && hi.images[1].raster->px[k] != rb->px[k]) bad++;
+                }
+                CHECK(bad == 0);
+            }
+            // The two dissolve in orders of their own: over the same place at the halfway point they cover about three quarters of it
+            // together (half and half, overlapping at random), not just the same half twice.
+            {
+                Picture p1, p2, mid;
+                p1.init(10, 20); p2.init(10, 20);
+                p1.place_image(ra, 1, 1);
+                p2.place_image(rb, 1, 1);
+                fade(p1, p2, 0.5, mid);
+                long both = 0;
+                if (mid.images.size() == 2)
+                    for (size_t k = 0; k < ra->px.size(); k++) both += (mid.images[0].raster->px[k].a != 0 || mid.images[1].raster->px[k].a != 0);
+                CHECK(both > 780 && both < 1020);                                  // of 1200: about 900
+            }
+            for (const Pixel& px : ra->px) CHECK(px.a != 0);                // the originals are not touched
+            for (const Pixel& px : rb->px) CHECK(px.a != 0);
+            Picture again;
+            fade(x, y, 0.3, again);
+            CHECK(again.images.size() == 2 && again.images[0].raster->px == lo.images[0].raster->px && again.images[1].raster->px == lo.images[1].raster->px);   // the same every time
+            // Only one of them has pictures; and pictures with nothing in them.
+            Picture none;
+            none.init(10, 20);
+            fade(x, none, 0.5, out);
+            CHECK(out.images.size() == 1 && count(out.images[0]) > 540 && count(out.images[0]) < 660);
+            fade(none, y, 0.5, out);
+            CHECK(out.images.size() == 1 && out.images[0].raster != rb);
+            fade(none, none, 0.5, out);
+            CHECK(out.images.empty());
+            Picture empty_raster;
+            empty_raster.init(10, 20);
+            empty_raster.place_image(std::make_shared<Raster>(), 1, 1);
+            fade(empty_raster, none, 0.5, out);
+            CHECK(out.images.size() == 1 && out.images[0].raster->px.empty());
+            // A fade of a fade (the show stacks them): weights multiply, and out may be a picture used before.
+            Picture z;
+            z.init(10, 20);
+            z.place_image(solid(40, 30, 0, 200, 0), 3, 3);
+            Picture first, second;
+            fade(x, y, 0.5, first);
+            fade(first, z, 0.5, second);
+            long total = 0;
+            for (const ImagePlacement& ip : second.images) total += count(ip);
+            CHECK(second.images.size() == 3 && total > 1080 && total < 1320);   // 600 * 0.5 + 600 * 0.5 + 1200 * 0.5 = 1200, give or take
+            // The shares really multiply: what the first fade kept is thinned again by the second (a second pass in the same
+            // order would keep all of it).
+            if (second.images.size() == 3 && first.images.size() == 2) {
+                CHECK(count(second.images[0]) < count(first.images[0]) * 6 / 10 && count(second.images[0]) > count(first.images[0]) * 4 / 10);
+                CHECK(count(second.images[1]) < count(first.images[1]) * 6 / 10 && count(second.images[1]) > count(first.images[1]) * 4 / 10);
+            }
+            CHECK(first.fade_level == 1 && second.fade_level == 2 && z.fade_level == 0 && x.fade_level == 0);
+            Picture copy = second;
+            CHECK(copy.fade_level == 2);
+            copy.init(10, 20);
+            CHECK(copy.fade_level == 0);
+            // The percentage is held between 0 and 1.
+            fade(x, y, -3.0, out);
+            CHECK(out.images.size() == 1 && out.images[0].raster == ra);
+            fade(x, y, 9.0, out);
+            CHECK(out.images.size() == 1 && out.images[0].raster == rb);
+        }
         // Raster basics: out of range is ignored; init of a nonsense size is empty.
         Raster z;
         z.init(-3, 4);
@@ -809,6 +901,34 @@ int main() {
         block->set(1, 1, 255, 0, 0);
         p.place_image(block, 1, 1);
         CHECK(d.render(p, 0).find("\x1bP") == std::string::npos);
+    }
+
+    // ---- a fade shown on a Display: at every step the screen has the pixels the faded picture asks for ----
+    {
+        const int R = 12, C = 30;
+        Display d;
+        d.init(R, C);
+        d.enable_images(CW, CH);
+        Model m;
+        m.init(R + 1, C, CW, CH);
+        std::mt19937 rng(11);
+        Picture a, b;
+        a.init(R, C); b.init(R, C);
+        for (int i = 0; i < R; i++) for (int j = 0; j < C; j++) { a.set(i, j, plain_cell(rng)); b.set(i, j, plain_cell(rng)); }
+        a.place_image(make_raster(rng, 80, 60, 4), 1, 2);
+        b.place_image(make_raster(rng, 70, 70, 5), 3, 8);
+        b.place_image(make_raster(rng, 40, 40, 3), 6, 18);
+        Picture mix;
+        long sent = 0;
+        for (int step = 0; step <= 20; step++) {
+            fade(a, b, step / 20.0, mix);
+            const std::string s = d.render(mix, step * 0.1);
+            sent += (long)s.size();
+            m.feed(s);
+            CHECK(!m.broken);
+            CHECK(pixel_mismatches(m, wanted(mix, C), 3) == 0);
+        }
+        CHECK(sent > 2000);
     }
 
     // ---- the whole thing at random: after every frame the terminal shows the right letters and the right pixels ----
