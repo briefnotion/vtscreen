@@ -176,6 +176,42 @@ Display the letters the terminal should show (`target`) and what it was last sen
 sending visits only the flagged cells and rows, so a frame with nothing flagged scans
 nothing.
 
+## Pictures made of pixels
+
+Besides letters, a `Picture` can carry real pixels, drawn on terminals that understand Sixel. vtscreen does not know
+where the pixels come from (a scene fills a `Raster` by its own code, a drawing library such as
+[vtpen](https://github.com/briefnotion/vtpen), a decoded image): they are plain RGBA pixels, and a pixel with `a == 0`
+draws nothing, so the letters under it show through.
+
+```cpp
+auto r = std::make_shared<vtscreen::Raster>();
+r->init(width_px, height_px);
+r->set(x, y, red, green, blue);              // alpha defaults to 255
+F.place_image(r, row, col);                  // its top left corner is at the cell (row, col)
+F.place_image(r, row, col, 3.0);             // letters under its pixels change at most 3 times a second (see below)
+```
+
+A program has to say that the terminal can draw them, and how big a character cell is in pixels (vtscreen never asks
+the terminal): `vtscreen::set_image_support(cell_w, cell_h)` before the Display is opened (`run()` and `Display::open()`
+use it), or `display.enable_images(cell_w, cell_h)`. Until then pictures are ignored and the output is exactly what it was
+without them (the tests check this byte for byte). `VTSCREEN_IMAGES` is defined when the library has them. The Display
+draws them after the letters, sends only the cells whose pixels changed (neighbours in a row as one picture), keeps them
+out of the status bar's row, and does nothing with them under `--no-color`. `fade()` takes the pictures of the picture
+that is ahead, like text. `detail::sixel_encode` is the encoder (up to 255 colours; with more, the most used are kept).
+
+**What a terminal does with letters over pixels** (measured in Windows Terminal): writing a letter into a cell takes that
+cell's pixels with it. So whenever a letter under a picture is written, that cell's pixels are sent again, which costs a
+good deal more than the letter did, and shimmering letters under thin lines make that happen all the time. The last
+argument of `place_image`, `letter_rate`, trades that cost against how current the letters are. The default, -1, lets
+letters change as often as the scene says. A number of 0 or more is how many times a second each cell under the
+picture's pixels may change (each cell takes its turn at a moment of its own); 0 is never while the picture is there. A cell
+that has to wait shows its old letter, colour and all, so a low rate means the content under a picture runs a little late and
+a very low one leaves stale patches while the picture's pixels sit over changing content. Text cells (`Picture::text`) are
+never held back, and the letters catch up when the picture leaves the cell. In vtshow's moonphases a rate of 0 saved only a
+quarter of the bytes and left a patchwork of stale cells, so the scene uses the default.
+
+Not done yet: reading Sixel (decoding a picture a program sent) and carrying pictures through vtmux's virtual screen.
+
 ## Tests
 
 `tests/run_tests.sh` builds `tests/retained_tests.cpp` with the strict warning flags and
@@ -198,6 +234,14 @@ terminal: the codes sent, nothing sent when nothing changed, underlined spaces, 
 redrawn when only one half changes, halves without a partner shown as blanks, `render_plain`, fades,
 and 16 000 random frames (retained and ordinary pictures, terminals that do and do not blank the
 other half of a wide letter written over) against what the pictures say.
+
+`tests/image_tests.cpp` (run by the same script) checks pictures made of pixels: the Sixel encoder against a decoder
+written in the test; that a Display not told about pictures sends exactly what it always did; and, on a model of a
+terminal that follows the bytes (a letter written into a cell wipes that cell's pixels, a Sixel picture leaves alone the
+pixels it does not draw), that after every one of about 2 000 random frames the screen shows the same letters as a letters-only
+Display, except where letters are held back, and exactly the pixels the pictures ask for: nothing more, nothing less. Also
+that only what changed is sent, wide letters, the status bar's row, pictures that hang off the screen, overlapping
+pictures, clears and letter rates.
 
 `tests/bench_render.cpp` prints the timings above.
 

@@ -88,6 +88,8 @@
 
 // Defined when the library has retained pictures (Picture::retain), so a program can tell.
 #define VTSCREEN_RETAINED 1
+// Defined when the library has pictures made of pixels (Raster, Picture::place_image, Display::enable_images).
+#define VTSCREEN_IMAGES 1
 
 // The one place a letter is worked out for a cell is the hot path of every frame; a compiler does not always inline it
 // by itself, and it is a good deal slower when it does not.
@@ -229,6 +231,60 @@ struct PicCell {
     bool operator!=(const PicCell& o) const { return !(*this == o); }
 };
 
+// ---------------------------------------------------------------- pictures made of pixels
+//
+// Besides letters, a Picture can carry real pixels: a Raster placed at a cell. A Display that has
+// been told the terminal can show Sixel pictures (Display::enable_images) draws them over the
+// letters; one that has not simply ignores them, and then its output is exactly what it was
+// without them. Nothing here knows where a Raster comes from: a scene fills it pixel by pixel,
+// whether by its own code, a drawing library or a decoded picture.
+//
+// A pixel with a of 0 draws nothing (what is below shows, letters included); any other a draws
+// the pixel in its colour. There is no half way: Sixel has none.
+struct Pixel {
+    uint8_t r = 0, g = 0, b = 0, a = 0;
+    bool operator==(const Pixel& o) const { return r == o.r && g == o.g && b == o.b && a == o.a; }
+    bool operator!=(const Pixel& o) const { return !(*this == o); }
+};
+
+struct Raster {
+    int w = 0, h = 0;
+    std::vector<Pixel> px;                    // w * h, row by row
+
+    void init(int W, int H) {
+        w = W > 0 ? W : 0;
+        h = H > 0 ? H : 0;
+        px.assign((size_t)w * (size_t)h, Pixel());
+    }
+    void clear() { std::fill(px.begin(), px.end(), Pixel()); }
+    bool inside(int x, int y) const { return x >= 0 && y >= 0 && x < w && y < h; }
+    Pixel& at(int x, int y) { return px[(size_t)y * w + x]; }
+    const Pixel& at(int x, int y) const { return px[(size_t)y * w + x]; }
+    // Out of range is left alone.
+    void set(int x, int y, int r, int g, int b, int a = 255) {
+        if (!inside(x, y)) return;
+        Pixel& p = at(x, y);
+        p.r = (uint8_t)r; p.g = (uint8_t)g; p.b = (uint8_t)b; p.a = (uint8_t)a;
+    }
+};
+
+// A Raster put on a Picture: its top left corner is at the cell (row, col).
+//
+// letter_rate: how often a letter under its pixels may change. A letter written into a cell takes that cell's pixels with
+// it, so when letters change under a picture (shimmer, a moving shade) every such cell has to be written and then drawn
+// again, which costs a lot more than the letter did, and shimmering letters under thin lines make it happen all the time.
+//   -1 (the default): as often as they like; the picture is sent again whenever a letter under it is written.
+//   a number of 0 or more: at most that many times a second for each cell that has pixels of this picture in it (the cells
+//      take their turns at different moments, so they do not all change in the same frame). 0 means never while the
+//      picture is on the cell. A cell that has to wait shows its old letter, colour and all, so a low rate lags: the content
+//      under a picture follows what the scene says, a little behind. Text cells (Picture::text) are never held back.
+// The letters catch up when the picture leaves the cell or this changes.
+struct ImagePlacement {
+    std::shared_ptr<const Raster> raster;
+    int row = 0, col = 0;
+    double letter_rate = -1;
+};
+
 namespace detail {
 // Every Picture has a number of its own, so a Display can tell which picture it showed last.
 inline uint64_t next_picture_serial() {
@@ -265,6 +321,14 @@ struct Picture {
     bool retained = false;                    // see above
     uint64_t serial = detail::next_picture_serial();
 
+    // Pictures made of pixels, drawn over the letters in this order (see Raster). The Raster is
+    // looked at when the picture is shown, so a scene can keep one and change it between frames.
+    std::vector<ImagePlacement> images;
+    void place_image(std::shared_ptr<const Raster> raster, int row, int col, double letter_rate = -1) {
+        if (raster) images.push_back({std::move(raster), row, col, letter_rate});
+    }
+    void clear_images() { images.clear(); }
+
     // Bookkeeping for retained mode; changed by a Display's render even for a const Picture.
     mutable bool all_touched = true;                     // every cell is new (init, a copy, a resize)
     mutable std::vector<unsigned char> touched;          // per cell: written since a render last looked
@@ -274,15 +338,16 @@ struct Picture {
 
     Picture() = default;
     // A copy has a number of its own, and every cell of it is new.
-    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained) {}
+    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained), images(o.images) {}
     Picture& operator=(const Picture& o) {
-        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; forget_flags(); }
+        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; images = o.images; forget_flags(); }
         return *this;
     }
-    Picture(Picture&& o) noexcept : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained) { o.forget_flags(); }
+    Picture(Picture&& o) noexcept
+        : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained), images(std::move(o.images)) { o.forget_flags(); }
     Picture& operator=(Picture&& o) noexcept {
         if (this != &o) {
-            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained;
+            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained; images = std::move(o.images);
             forget_flags(); o.forget_flags();
         }
         return *this;
@@ -294,6 +359,7 @@ struct Picture {
     void init(int R, int C) {
         rows = R + 1; cols = C;
         cell.assign((size_t)(R + 1) * C, PicCell());
+        images.clear();                           // starting over: no pictures made of pixels either
         forget_flags();
     }
     int bar_row() const { return rows - 1; }
@@ -406,6 +472,7 @@ inline void fade(const Picture& a, const Picture& b, double pct, Picture& out) {
     const double wa = 1.0 - pct, wb = pct;
     out.rows = a.rows; out.cols = a.cols;
     out.cell.resize(a.cell.size());
+    out.images = pct < 0.5 ? a.images : b.images;     // pixels cannot be mixed: they go with the picture that is ahead, like text
     out.touch_all();                          // every cell is written below
     for (size_t i = 0; i < a.cell.size(); i++) {
         const PicCell& p = a.cell[i];
@@ -634,6 +701,15 @@ struct Options {
     int cols = 0, rows = 0;   // 0: use the terminal's size
 };
 
+// The size of a character cell in pixels, if the terminal can show Sixel pictures. The program
+// that runs a scene finds that out (vtscreen does not ask the terminal) and says so before the
+// Display is opened; open() then turns pictures made of pixels on. 0: they are ignored.
+inline int g_image_cell_w = 0, g_image_cell_h = 0;
+inline void set_image_support(int cell_w, int cell_h) {
+    g_image_cell_w = cell_w > 0 ? cell_w : 0;
+    g_image_cell_h = cell_h > 0 ? cell_h : 0;
+}
+
 inline volatile sig_atomic_t g_stop = 0;
 inline void on_sigint(int) { g_stop = 1; }
 // The terminal sends SIGWINCH when its window changes size. The handler can only set
@@ -699,6 +775,153 @@ static std::string status(int cols, double t, bool color, bool loop) {
 }
 #endif
 
+// ---------------------------------------------------------------- Sixel
+//
+// Sixel is how a terminal is told to draw pixels: the picture goes out as text, six pixel rows at
+// a time, one colour at a time. detail::sixel_encode makes that text from a block of pixels.
+namespace detail {
+
+// The Sixel text (ESC P ... ESC \) for the w x h pixels at base, whose rows are stride pixels
+// apart. A pixel with a of 0 is left out (the picture is drawn without touching what is there).
+// A picture can use 255 colours: with more, the 255 most used are kept, each shown by the average
+// of the colours that fell in its bin of 8 levels per channel, and every other pixel takes the
+// nearest of those. Long runs of one letter are written as a count.
+inline std::string sixel_encode(const Pixel* base, int stride, int w, int h) {
+    auto key = [](const Pixel& p) { return ((uint32_t)p.r << 16) | ((uint32_t)p.g << 8) | p.b; };
+    const size_t n = (size_t)w * (size_t)h;
+    std::string s = "\x1bP0;1;0q\"1;1;" + std::to_string(w) + ";" + std::to_string(h);
+    if (w <= 0 || h <= 0) return s + "\x1b\\";
+
+    // 1. which colours
+    std::vector<uint32_t> keys;                  // sorted, at most 255 while it is exact
+    bool exact = true;
+    uint32_t previous = 0xffffffffu;
+    for (int y = 0; y < h && exact; y++) {
+        const Pixel* row = base + (size_t)y * stride;
+        for (int x = 0; x < w; x++) {
+            if (row[x].a == 0) continue;
+            const uint32_t k = key(row[x]);
+            if (k == previous) continue;
+            previous = k;
+            auto at = std::lower_bound(keys.begin(), keys.end(), k);
+            if (at != keys.end() && *at == k) continue;
+            if (keys.size() >= 255) { exact = false; break; }
+            keys.insert(at, k);
+        }
+    }
+
+    std::vector<Pixel> palette;
+    std::vector<int> index(n, -1);               // -1: not drawn
+    if (exact) {
+        for (uint32_t k : keys) palette.push_back({(uint8_t)(k >> 16), (uint8_t)(k >> 8), (uint8_t)k, 255});
+        previous = 0xffffffffu;
+        int last = -1;
+        for (int y = 0; y < h; y++) {
+            const Pixel* row = base + (size_t)y * stride;
+            for (int x = 0; x < w; x++) {
+                if (row[x].a == 0) continue;
+                const uint32_t k = key(row[x]);
+                if (k != previous) { previous = k; last = (int)(std::lower_bound(keys.begin(), keys.end(), k) - keys.begin()); }
+                index[(size_t)y * w + x] = last;
+            }
+        }
+    } else {
+        struct Bin { uint32_t count = 0, r = 0, g = 0, b = 0; };
+        std::vector<Bin> bins(32768);
+        auto bin_of = [](const Pixel& p) { return ((p.r >> 3) << 10) | ((p.g >> 3) << 5) | (p.b >> 3); };
+        for (int y = 0; y < h; y++) {
+            const Pixel* row = base + (size_t)y * stride;
+            for (int x = 0; x < w; x++) {
+                if (row[x].a == 0) continue;
+                Bin& b = bins[(size_t)bin_of(row[x])];
+                b.count++; b.r += row[x].r; b.g += row[x].g; b.b += row[x].b;
+            }
+        }
+        std::vector<int> used;
+        for (int k = 0; k < 32768; k++) if (bins[(size_t)k].count) used.push_back(k);
+        std::stable_sort(used.begin(), used.end(), [&](int a, int b) { return bins[(size_t)a].count > bins[(size_t)b].count; });
+        const size_t keep = std::min<size_t>(255, used.size());
+        auto average = [&](int k) {
+            const Bin& b = bins[(size_t)k];
+            return Pixel{(uint8_t)(b.r / b.count), (uint8_t)(b.g / b.count), (uint8_t)(b.b / b.count), 255};
+        };
+        std::vector<int> pal_of_bin(32768, -1);
+        for (size_t i = 0; i < keep; i++) { palette.push_back(average(used[i])); pal_of_bin[(size_t)used[i]] = (int)i; }
+        for (size_t i = keep; i < used.size(); i++) {          // the rest: the nearest kept colour
+            const Pixel c = average(used[i]);
+            int best = 0, best_d = 1 << 30;
+            for (size_t j = 0; j < keep; j++) {
+                const int dr = c.r - palette[j].r, dg = c.g - palette[j].g, db = c.b - palette[j].b;
+                const int d = dr * dr + dg * dg + db * db;
+                if (d < best_d) { best_d = d; best = (int)j; }
+            }
+            pal_of_bin[(size_t)used[i]] = best;
+        }
+        for (int y = 0; y < h; y++) {
+            const Pixel* row = base + (size_t)y * stride;
+            for (int x = 0; x < w; x++)
+                if (row[x].a != 0) index[(size_t)y * w + x] = pal_of_bin[(size_t)bin_of(row[x])];
+        }
+    }
+
+    // 2. the colours (Sixel counts them in percent)
+    auto pct = [](int v) { return (v * 100 + 127) / 255; };
+    for (size_t i = 0; i < palette.size(); i++)
+        s += "#" + std::to_string(i) + ";2;" + std::to_string(pct(palette[i].r)) + ";" +
+             std::to_string(pct(palette[i].g)) + ";" + std::to_string(pct(palette[i].b));
+
+    // 3. bands of six pixel rows, one pass per colour used in the band. Each colour's row is kept
+    //    between bands (all '?', which is "no pixels") and only the stretch from its first to its
+    //    last pixel is visited and cleared.
+    std::vector<std::string> rows(palette.size());
+    std::vector<char> used(palette.size(), 0);
+    std::vector<int> first_x(palette.size(), 0), last_x(palette.size(), 0);
+    for (int top = 0; top < h; top += 6) {
+        std::vector<size_t> order;
+        for (int b = 0; b < 6 && top + b < h; b++) {
+            const int* row_index = &index[(size_t)(top + b) * w];
+            for (int x = 0; x < w; x++) {
+                const int c = row_index[x];
+                if (c < 0) continue;
+                if (!used[(size_t)c]) {
+                    used[(size_t)c] = 1;
+                    if (rows[(size_t)c].empty()) rows[(size_t)c].assign((size_t)w, '?');
+                    first_x[(size_t)c] = last_x[(size_t)c] = x;
+                    order.push_back((size_t)c);
+                } else {
+                    if (x < first_x[(size_t)c]) first_x[(size_t)c] = x;
+                    if (x > last_x[(size_t)c]) last_x[(size_t)c] = x;
+                }
+                rows[(size_t)c][(size_t)x] = (char)(rows[(size_t)c][(size_t)x] + (1 << b));
+            }
+        }
+        std::sort(order.begin(), order.end());
+        bool first = true;
+        for (size_t c : order) {
+            std::string& row = rows[c];
+            const size_t lo = (size_t)first_x[c], hi = (size_t)last_x[c] + 1;
+            if (!first) s += "$";                  // back to the left edge of the same band
+            first = false;
+            s += "#" + std::to_string(c);
+            if (lo > 3) s += "!" + std::to_string(lo) + "?";
+            else s.append(lo, '?');
+            for (size_t i = lo; i < hi;) {
+                size_t j = i;
+                while (j < hi && row[j] == row[i]) j++;
+                if (j - i > 3) s += "!" + std::to_string(j - i) + row[i];
+                else s.append(row, i, j - i);
+                i = j;
+            }
+            std::fill(row.begin() + (std::ptrdiff_t)lo, row.begin() + (std::ptrdiff_t)hi, '?');
+            used[c] = 0;
+        }
+        if (top + 6 < h) s += "-";                 // the next band
+    }
+    return s + "\x1b\\";
+}
+
+}  // namespace detail
+
 // ---------------------------------------------------------------- the display: pictures onto the terminal
 //
 // The Display is the renderer. Given a Picture (brightness and colour for every
@@ -731,7 +954,20 @@ public:
         row_changed_.assign((size_t)(pic_rows + 1), 0);
         any_changed_ = false;
         have_last_ = false;
+        image_reset();
     }
+
+    // Say that the terminal can draw Sixel pictures and how big one of its character cells is in
+    // pixels (the program has to find that out, for example by asking the terminal). From now on
+    // the pictures made of pixels that a Picture carries (Picture::place_image) are drawn over the
+    // letters; the letters under them stay, and show through where a picture has nothing. Until
+    // this is called, they are ignored. Call it before the first frame, with 0 to turn it off.
+    void enable_images(int cell_w, int cell_h) {
+        img_cw_ = (cell_w > 0 && cell_h > 0) ? cell_w : 0;
+        img_ch_ = img_cw_ > 0 ? cell_h : 0;
+        image_reset();
+    }
+    bool images_enabled() const { return img_cw_ > 0; }
 
     // The terminal changed size: cols x rows is the whole terminal, as in open().
     // The buffers are made again at the new size, the terminal is cleared and the
@@ -761,14 +997,20 @@ public:
         }
         pen_inv = 0; pr = pg = pb = -1; pen_alt = false; par = pag = pab = -1; pen_attrs = 0;
         cur_r = cur_c = -1;
+        image_reset();                            // the clear took the pictures too
         return "\x1b[0m\x1b[H\x1b[2J";
     }
 
     // pic: a whole screen, as made by Picture::init (the bar row included). t:
     // seconds (drives the shimmer). Returns the bytes to write to the terminal.
     std::string render(const Picture& pic, double t) {
+        const bool images = img_cw_ > 0 && color;
+        render_t_ = t;
+        if (images) prepare_images(pic);            // what the pictures ask for, before the letters (some letters are held)
         to_letters(pic, t);
-        return send();
+        std::string out = send();
+        if (images) out += send_images();
+        return out;
     }
 
     // Write the default status bar into the bottom row of pic: the scene's title
@@ -857,6 +1099,8 @@ public:
 #endif
         init(rows - 1, cols);                  // the picture; the status line goes underneath
         write_all(refresh());
+        // The program said (set_image_support) that the terminal can draw Sixel pictures: use them (not without colour).
+        if (g_image_cell_w > 0 && g_image_cell_h > 0 && o.color) enable_images(g_image_cell_w, g_image_cell_h);
         is_open = true;
     }
 
@@ -1036,6 +1280,21 @@ private:
 
     VtScreen shown;                               // what the terminal is showing
     VtScreen target;                              // the picture as letters, this frame
+    // Pictures made of pixels (see enable_images). The terminal wipes a cell's pixels when a letter is
+    // written into it, so what is kept here is, per cell, whether there are pixels in it now.
+    int img_cw_ = 0, img_ch_ = 0;                 // pixels per cell; 0: off
+    std::vector<Pixel> img_on_;                   // the whole screen in pixels: what the terminal shows of the pictures
+    std::vector<Pixel> img_want_;                 // the same size: what the pictures ask for, put together
+    std::vector<unsigned char> img_ink_;          // per cell: there are picture pixels in it on the terminal
+    std::vector<unsigned char> written_;          // per cell: a letter was written into it since the pictures were last looked at
+    size_t ink_count_ = 0;                        // how many cells have ink
+    std::vector<unsigned char> img_hold_;         // per cell: its letter is held back this frame (see ImagePlacement::letter_rate)
+    std::vector<float> hold_rate_;                // per cell: how often a held cell's letter may change (see ImagePlacement::letter_rate)
+    std::vector<long> hold_slot_;                 // per cell: the time slot of its last allowed change
+    double render_t_ = 0;                         // the time of the frame being rendered
+    bool hold_any_ = false;                       // img_hold_ has a cell set
+    bool img_active_ = false;                     // prepare_images found pictures to do: send_images has work
+    int img_i0_ = 0, img_i1_ = -1, img_j0_ = 0, img_j1_ = -1;   // the cells they cover, and the ones with pixels now
     std::vector<unsigned char> changed_;          // per cell: target may differ from shown (a hint)
     std::vector<unsigned char> row_changed_;      // per row: a cell in it is flagged
     bool any_changed_ = false;                    // anything is flagged
@@ -1120,6 +1379,184 @@ private:
         last_serial_ = F.serial;
     }
 
+    void image_reset() {
+        img_on_.clear(); img_want_.clear(); img_ink_.clear(); written_.clear(); img_hold_.clear(); hold_rate_.clear(); hold_slot_.clear();
+        ink_count_ = 0;
+        hold_any_ = false; img_active_ = false;
+    }
+
+    // May the held letter of cell idx change now? Each cell has a turn letter_rate times a second, at a moment of its own.
+    bool letter_due(size_t idx) {
+        const double rate = hold_rate_[idx];
+        if (rate <= 0.0) return false;
+        const double phase = (double)((idx * 2654435761u) >> 8 & 1023u) / 1024.0;
+        const long slot = (long)std::floor(render_t_ * rate + phase);
+        if (slot == hold_slot_[idx]) return false;
+        hold_slot_[idx] = slot;
+        return true;
+    }
+
+    // A letter was written into cell (i, j): any picture pixels it had are gone.
+    void note_letter(int i, int j) {
+        if (ink_count_ == 0) return;
+        const size_t idx = (size_t)i * shown.cols + j;
+        if (idx < written_.size()) written_[idx] = 1;
+    }
+
+    // Write the letter of cell (i, j) again, which takes the picture pixels out of it. A half of a
+    // wide letter is written through its first half, which clears both. Returns the first cell written.
+    int wipe_cell(std::string& out, int i, int j) {
+        VtCell k = drawn(i, j);
+        int head = j;
+        if ((k.attrs & CELL_TAIL) && j > 0) head = j - 1;
+        // A held letter is written again as it is on the terminal now, not as the picture of this frame has it.
+        const size_t hidx = (size_t)i * shown.cols + head;
+        const bool held = hidx < img_hold_.size() && img_hold_[hidx];
+        put(out, i, head, held ? shown.cell[hidx] : drawn(i, head));
+        const int cols = shown.cols;
+        for (int x = head; x <= head + 1 && x < cols; x++) {
+            if (x != head && !(drawn(i, head).attrs & CELL_WIDE)) break;
+            const size_t idx = (size_t)i * cols + x;
+            if (img_ink_[idx]) { img_ink_[idx] = 0; ink_count_--; }
+        }
+        return head;
+    }
+
+    // Put the pictures together for this frame (what the terminal should show of them), before the letters are chosen:
+    // some letters may be held back under them (see ImagePlacement::letter_rate).
+    void prepare_images(const Picture& pic) {
+        img_active_ = false;
+        hold_any_ = false;
+        if (pic.images.empty() && ink_count_ == 0) return;
+        const int rows = shown.rows, cols = shown.cols, cw = img_cw_, ch = img_ch_;
+        const int W = cols * cw, H = rows * ch;
+        const int pic_rows = rows - 1;
+        if (img_ink_.size() != (size_t)rows * cols) {
+            img_on_.assign((size_t)W * H, Pixel());
+            img_want_.assign((size_t)W * H, Pixel());
+            img_ink_.assign((size_t)rows * cols, 0);
+            written_.assign((size_t)rows * cols, 0);
+            img_hold_.assign((size_t)rows * cols, 0);
+            hold_rate_.assign((size_t)rows * cols, -1.0f);
+            hold_slot_.assign((size_t)rows * cols, -1000000000L);
+            ink_count_ = 0;
+        }
+
+        // 1. the cells the pictures cover, and the ones that have pixels now
+        int i0 = rows, i1 = -1, j0 = cols, j1 = -1;
+        auto cover = [&](int i, int j) { i0 = std::min(i0, i); i1 = std::max(i1, i); j0 = std::min(j0, j); j1 = std::max(j1, j); };
+        for (const ImagePlacement& p : pic.images) {
+            if (!p.raster || p.raster->w <= 0 || p.raster->h <= 0) continue;
+            const int a = std::max(0, p.row), b = std::min(pic_rows - 1, p.row + (p.raster->h + ch - 1) / ch - 1);
+            const int c = std::max(0, p.col), d = std::min(cols - 1, p.col + (p.raster->w + cw - 1) / cw - 1);
+            if (a <= b && c <= d) { cover(a, c); cover(b, d); }
+        }
+        if (ink_count_ > 0)
+            for (int i = 0; i < rows; i++)
+                for (int j = 0; j < cols; j++)
+                    if (img_ink_[(size_t)i * cols + j]) cover(i, j);
+        if (i1 < 0) return;                                       // nothing to draw and nothing to take off
+        img_i0_ = i0; img_i1_ = i1; img_j0_ = j0; img_j1_ = j1;
+        img_active_ = true;
+
+        // 2. put the pictures together, inside that block of cells, and note the cells a holding picture has pixels in
+        for (int y = i0 * ch; y < (i1 + 1) * ch; y++)
+            std::fill(img_want_.begin() + (std::ptrdiff_t)y * W + j0 * cw, img_want_.begin() + (std::ptrdiff_t)y * W + (j1 + 1) * cw, Pixel());
+        std::fill(hold_rate_.begin(), hold_rate_.end(), -1.0f);       // -1: no picture that holds has pixels here
+        std::fill(img_hold_.begin(), img_hold_.end(), (unsigned char)0);
+        for (const ImagePlacement& p : pic.images) {
+            if (!p.raster) continue;
+            const Raster& r = *p.raster;
+            for (int y = 0; y < r.h; y++) {
+                const int py = p.row * ch + y;
+                if (py < 0 || py >= pic_rows * ch) continue;
+                for (int x = 0; x < r.w; x++) {
+                    const int px = p.col * cw + x;
+                    if (px < 0 || px >= W) continue;
+                    const Pixel& q = r.at(x, y);
+                    if (q.a == 0) continue;
+                    img_want_[(size_t)py * W + px] = Pixel{q.r, q.g, q.b, 255};
+                    if (p.letter_rate >= 0) {
+                        float& r = hold_rate_[(size_t)(py / ch) * cols + (size_t)(px / cw)];
+                        r = std::max(r, (float)p.letter_rate);                                  // the most generous of the pictures here
+                    }
+                }
+            }
+        }
+
+        // 3. which letters are held: under a holding picture's pixels, where the picture is already drawn, except text
+        for (int i = i0; i <= i1; i++)
+            for (int j = j0; j <= j1; j++) {
+                const size_t idx = (size_t)i * cols + j;
+                if (hold_rate_[idx] >= 0.0f && img_ink_[idx] && i < pic.rows && j < pic.cols && !pic.at(i, j).text) { img_hold_[idx] = 1; hold_any_ = true; }
+            }
+    }
+
+    // Draw the pictures made of pixels that prepare_images put together, after the letters. Only the cells whose
+    // pixels differ from what the terminal shows are sent, and cells where a letter was just
+    // written (which wiped them) are sent again. Neighbouring cells go together as one picture.
+    // The last row is the status bar: no pictures go there.
+    std::string send_images() {
+        std::string out;
+        if (!img_active_) return out;
+        const int cols = shown.cols, cw = img_cw_, ch = img_ch_;
+        const int W = cols * cw;
+        const int i0 = img_i0_, i1 = img_i1_, j0 = img_j0_, j1 = img_j1_;
+
+        auto tile = [&](const std::vector<Pixel>& v, int i, int j) { return &v[(size_t)(i * ch) * W + (size_t)j * cw]; };
+        auto tile_empty = [&](int i, int j) {
+            for (int y = 0; y < ch; y++) {
+                const Pixel* p = tile(img_want_, i, j) + (size_t)y * W;
+                for (int x = 0; x < cw; x++) if (p[x].a != 0) return false;
+            }
+            return true;
+        };
+        auto tile_same = [&](int i, int j) {
+            for (int y = 0; y < ch; y++)
+                if (std::memcmp(tile(img_on_, i, j) + (size_t)y * W, tile(img_want_, i, j) + (size_t)y * W, (size_t)cw * sizeof(Pixel)) != 0) return false;
+            return true;
+        };
+
+        // 3. row by row: first take pixels out of cells that must lose or change theirs, then send
+        for (int i = i0; i <= i1; i++) {
+            for (int j = j0; j <= j1; j++) {                      // a letter written here took its pixels
+                const size_t idx = (size_t)i * cols + j;
+                if (written_[idx] && img_ink_[idx]) { img_ink_[idx] = 0; ink_count_--; }
+            }
+            for (int j = j0; j <= j1; j++) {
+                const size_t idx = (size_t)i * cols + j;
+                if (img_ink_[idx] && (tile_empty(i, j) || !tile_same(i, j))) wipe_cell(out, i, j);
+            }
+            // Writing a letter can write the short gap before it again too (see put()), which takes the pixels of those cells.
+            for (int j = j0; j <= j1; j++) {
+                const size_t idx = (size_t)i * cols + j;
+                if (written_[idx] && img_ink_[idx]) { img_ink_[idx] = 0; ink_count_--; }
+            }
+            for (int j = j0; j <= j1;) {
+                const size_t idx = (size_t)i * cols + j;
+                const bool need = !tile_empty(i, j) && (!img_ink_[idx] || !tile_same(i, j));
+                if (!need) { j++; continue; }
+                int end = j;
+                while (end <= j1 && !tile_empty(i, end) && (!img_ink_[(size_t)i * cols + end] || !tile_same(i, end))) end++;
+                char esc[40];
+                std::snprintf(esc, sizeof esc, "\x1b[%d;%dH", i + 1, j + 1);
+                out += esc;
+                out += detail::sixel_encode(tile(img_want_, i, j), W, (end - j) * cw, ch);
+                for (int x = j; x < end; x++) {
+                    for (int y = 0; y < ch; y++) {
+                        const Pixel* from = tile(img_want_, i, x) + (size_t)y * W;
+                        std::copy(from, from + cw, img_on_.begin() + (std::ptrdiff_t)(i * ch + y) * W + (std::ptrdiff_t)x * cw);
+                    }
+                    if (!img_ink_[(size_t)i * cols + x]) { img_ink_[(size_t)i * cols + x] = 1; ink_count_++; }
+                }
+                cur_r = cur_c = -1;                               // where a picture leaves the cursor is not trusted
+                j = end;
+            }
+        }
+        std::fill(written_.begin(), written_.end(), (unsigned char)0);
+        return out;
+    }
+
     // The cell as it is drawn: the target's, except that half of a wide letter without its other half is a blank (keeping its background).
     VtCell drawn(int i, int j) const {
         VtCell k = target.at(i, j);
@@ -1149,7 +1586,7 @@ private:
                                          : !pen_alt));
             }
             if (free) {
-                for (int x = cur_c; x < j; x++) detail::append_utf8(out, shown.at(i, x).ch);
+                for (int x = cur_c; x < j; x++) { detail::append_utf8(out, shown.at(i, x).ch); note_letter(i, x); }
                 cur_c = j;
             }
         }
@@ -1183,7 +1620,9 @@ private:
         }
         detail::append_utf8(out, (k.attrs & CELL_TAIL) ? U' ' : k.ch);
         shown.cell[idx] = k;
+        note_letter(i, j);
         if (k.attrs & CELL_WIDE) {
+            note_letter(i, j + 1);
             // it takes two columns: its second half is shown with it. Where the terminal's cursor is now is not trusted (terminals differ on
             // how wide some letters are), so the next write moves it for certain.
             shown.cell[idx + 1] = drawn(i, j + 1);
@@ -1200,6 +1639,7 @@ private:
         std::string out;
         if (!any_changed_) return out;                  // nothing is flagged: nothing to look at, nothing to send
         const int rows = shown.rows, cols = shown.cols;
+        bool kept = false;                              // a held letter is still flagged
         for (int i = 0; i < rows; i++) {
             if (!row_changed_[(size_t)i]) continue;
             row_changed_[(size_t)i] = 0;
@@ -1209,6 +1649,13 @@ private:
                 changed_[idx] = 0;
                 const VtCell k = drawn(i, j);
                 if (k == shown.cell[idx]) continue;
+                if (hold_any_ && img_hold_[idx] && !((k.attrs | shown.cell[idx].attrs) & (CELL_WIDE | CELL_TAIL))) {
+                    if (!letter_due(idx)) {
+                        changed_[idx] = 1; row_changed_[(size_t)i] = 1; kept = true;     // not now: the picture over it keeps it as it is
+                        continue;
+                    }
+                    img_hold_[idx] = 0;                                                  // its turn: written like any other
+                }
                 if ((k.attrs & CELL_TAIL) && j > 0) {
                     // the second half of a wide letter changed and its first half did not: the first half draws both, so draw it again
                     put(out, i, j - 1, drawn(i, j - 1));
@@ -1217,7 +1664,7 @@ private:
                 put(out, i, j, k);
             }
         }
-        any_changed_ = false;
+        any_changed_ = kept;
         return out;
     }
 };
