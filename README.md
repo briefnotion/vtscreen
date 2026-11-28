@@ -249,6 +249,10 @@ Scrolling the terminal's text with a ReGIS picture on screen is slow in xterm: d
 `fade()` carries drawings with a weight: as pixels they dissolve like a `Raster`, as ReGIS the one that is at least half
 there is drawn, so lines pop at the halfway point.
 
+Without colour (`--no-color`) pictures are left out, because most of them are coloured. A program whose pictures suit a
+screen without colour (white lines, say) sets `display.pictures_without_colour = true` before `open()` to show them anyway;
+then drawings and pictures are drawn as asked and only the letters lose their colour codes.
+
 When the Display closes, the ReGIS screen is wiped. Keep drawings out of the status bar's row (the last one).
 
 Not done: ReGIS is only checked in xterm 412 built with it (run as a VT340), not on a hardware terminal or another emulator.

@@ -1218,6 +1218,10 @@ inline bool sixel_decode(std::string_view data, int p2, Raster& out, const Sixel
 class Display {
 public:
     bool color = true;            // send colour codes
+    // Pictures (made of pixels or of shapes) are left out when colour is off (--no-color), because most of them are
+    // coloured. A program whose pictures suit a screen without colour (white lines, say) sets this to show them anyway.
+    // Set it before open(), which turns pictures on only if colour is on or this is.
+    bool pictures_without_colour = false;
     bool hash_letters = false;    // how the letter inside a group is chosen
     int  fps = 30;                // the shimmer speed follows this
     bool quit_on_q = true;        // q (or Q) quits; a program that lets the person type text turns it off
@@ -1305,9 +1309,9 @@ public:
     // pic: a whole screen, as made by Picture::init (the bar row included). t:
     // seconds (drives the shimmer). Returns the bytes to write to the terminal.
     std::string render(const Picture& pic, double t) {
-        const bool images = img_cw_ > 0 && color;
+        const bool images = img_cw_ > 0 && (color || pictures_without_colour);
 #ifdef VTSCREEN_VECTORS
-        const bool regis = reg_cw_ > 0 && color;
+        const bool regis = reg_cw_ > 0 && (color || pictures_without_colour);
 #else
         const bool regis = false;
 #endif
@@ -1409,9 +1413,9 @@ public:
         init(rows - 1, cols);                  // the picture; the status line goes underneath
         write_all(refresh());
         // The program said (set_image_support) that the terminal can draw Sixel pictures: use them (not without colour).
-        if (g_image_cell_w > 0 && g_image_cell_h > 0 && o.color) enable_images(g_image_cell_w, g_image_cell_h);
+        if (g_image_cell_w > 0 && g_image_cell_h > 0 && (o.color || pictures_without_colour)) enable_images(g_image_cell_w, g_image_cell_h);
 #ifdef VTSCREEN_VECTORS
-        if (g_regis_cell_w > 0 && o.color) enable_regis(g_regis_cell_w, g_regis_cell_h, g_regis_surface_w, g_regis_surface_h);
+        if (g_regis_cell_w > 0 && (o.color || pictures_without_colour)) enable_regis(g_regis_cell_w, g_regis_cell_h, g_regis_surface_w, g_regis_surface_h);
 #endif
         is_open = true;
     }

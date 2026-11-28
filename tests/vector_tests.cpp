@@ -557,6 +557,48 @@ int main() {
                     with_drawings, bytes, frames_empty);
     }
 
+    // ---- without colour: left out, unless the program says its pictures suit that ----
+    {
+        auto drawing = make_drawing(rng);
+        Picture p;
+        all_letters(p, 'x');
+        p.place_drawing(drawing, 2, 5, 4, 20);
+        // as ReGIS
+        Display left_out, shown, plain;
+        left_out.init(R, C); shown.init(R, C); plain.init(R, C);
+        left_out.color = shown.color = plain.color = false;
+        shown.pictures_without_colour = true;
+        left_out.enable_regis(CW, CH, SW, SH);
+        shown.enable_regis(CW, CH, SW, SH);
+        CHECK(left_out.render(p, 0) == plain.render(p, 0));                      // as before: nothing
+        Model m;
+        m.init();
+        const std::string s = shown.render(p, 0);
+        m.feed(s);
+        CHECK(!m.broken && m.regis_strings == 1 && s.find("\x1b[38;") == std::string::npos && s.find("\x1b[48;") == std::string::npos);   // no colour codes for the letters
+        CHECK(ink_differences(m, expected_ink({{drawing, 2, 5, 4, 20}})) == 0 && ink_count(m) > 50);
+        // a Display that has colour does not need the flag
+        Display with_colour;
+        with_colour.init(R, C);
+        with_colour.enable_regis(CW, CH, SW, SH);
+        CHECK(with_colour.render(p, 0).find("\x1bP1p") != std::string::npos);
+        // as Sixel pixels
+        Display sixel_left_out, sixel_shown, sixel_raster;
+        sixel_left_out.init(R, C); sixel_shown.init(R, C); sixel_raster.init(R, C);
+        sixel_left_out.color = sixel_shown.color = sixel_raster.color = false;
+        sixel_shown.pictures_without_colour = sixel_raster.pictures_without_colour = true;
+        sixel_left_out.enable_images(CW, CH); sixel_shown.enable_images(CW, CH); sixel_raster.enable_images(CW, CH);
+        Display plain_again;
+        plain_again.init(R, C);
+        plain_again.color = false;
+        CHECK(sixel_left_out.render(p, 0) == plain_again.render(p, 0));
+        Picture q;
+        all_letters(q, 'x');
+        q.place_image(as_raster(*drawing, 4, 20, sixel_shown.vector_edge_levels), 2, 5);
+        const std::string a = sixel_shown.render(p, 0), b = sixel_raster.render(q, 0);
+        CHECK(a == b && a.find("\x1bP0;1;0q") != std::string::npos);
+    }
+
     // ---- ReGIS and Sixel both: drawings go as ReGIS, pictures made of pixels as Sixel ----
     {
         Display d;
