@@ -55,6 +55,17 @@
 #include <utility>
 #include <vector>
 
+// Vector pictures (Picture::place_drawing) are shapes described with vtpen (https://github.com/briefnotion/vtpen), which
+// the Display shows as ReGIS lines or as pixels. They need vtpen's headers on the include path (-I<vtpen>/include);
+// without them nothing about them exists and everything else is as it was.
+namespace vtpen { class Drawing; }
+#if defined(__has_include)
+#if __has_include("vtpen_regis.h")
+#include "vtpen_regis.h"
+#define VTSCREEN_VECTORS 1
+#endif
+#endif
+
 #ifdef VTSCREEN_WINDOWS
 #ifndef NOMINMAX
 #define NOMINMAX                  // keep std::min and std::max working
@@ -286,6 +297,25 @@ struct ImagePlacement {
     double letter_rate = -1;
 };
 
+// A drawing made of shapes (vtpen::Drawing: lines, curves, fills, in colour) put on a Picture over a block of cells: the
+// drawing's whole space is stretched over the rows x cols cells that start at (row, col). Unlike a Raster it says what
+// is drawn, not which pixels, so the Display can show it the way the terminal does best: as ReGIS lines when the program
+// has said the terminal does ReGIS (Display::enable_regis), else as pixels, like a Raster, when it does Sixel
+// (Display::enable_images), else not at all. A Display with neither ignores it, so the letters are what they were.
+// The Drawing is looked at when the picture is shown and is never changed by the library. Give the same Drawing again
+// (the same shared_ptr) in the next frame and nothing is worked out again; a new one is drawn.
+//   letter_rate: as for a Raster (ImagePlacement::letter_rate), and only when the drawing is shown as pixels: a drawing shown as
+//   ReGIS is drawn again whenever a letter is written under it.
+//   weight, seed: set by fade() when pictures are mixed, not by a scene. A weight under 1 dissolves a drawing shown as
+//   pixels; a drawing shown as ReGIS cannot dissolve and is drawn while its weight is at least a half.
+struct VectorPlacement {
+    std::shared_ptr<const vtpen::Drawing> drawing;
+    int row = 0, col = 0, rows = 0, cols = 0;
+    double weight = 1;
+    uint32_t seed = 0;
+    double letter_rate = -1;
+};
+
 namespace detail {
 // Every Picture has a number of its own, so a Display can tell which picture it showed last.
 inline uint64_t next_picture_serial() {
@@ -334,6 +364,13 @@ struct Picture {
     }
     void clear_images() { images.clear(); }
 
+    // Drawings made of shapes, over the cells (see VectorPlacement), in this order, after the pictures made of pixels.
+    std::vector<VectorPlacement> vectors;
+    void place_drawing(std::shared_ptr<const vtpen::Drawing> drawing, int row, int col, int rows, int cols, double letter_rate = -1) {
+        if (drawing && rows > 0 && cols > 0) vectors.push_back({std::move(drawing), row, col, rows, cols, 1.0, 0, letter_rate});
+    }
+    void clear_vectors() { vectors.clear(); }
+
     // Bookkeeping for retained mode; changed by a Display's render even for a const Picture.
     mutable bool all_touched = true;                     // every cell is new (init, a copy, a resize)
     mutable std::vector<unsigned char> touched;          // per cell: written since a render last looked
@@ -343,16 +380,16 @@ struct Picture {
 
     Picture() = default;
     // A copy has a number of its own, and every cell of it is new.
-    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained), fade_level(o.fade_level), images(o.images) {}
+    Picture(const Picture& o) : rows(o.rows), cols(o.cols), cell(o.cell), retained(o.retained), fade_level(o.fade_level), images(o.images), vectors(o.vectors) {}
     Picture& operator=(const Picture& o) {
-        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; fade_level = o.fade_level; images = o.images; forget_flags(); }
+        if (this != &o) { rows = o.rows; cols = o.cols; cell = o.cell; retained = o.retained; fade_level = o.fade_level; images = o.images; vectors = o.vectors; forget_flags(); }
         return *this;
     }
     Picture(Picture&& o) noexcept
-        : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained), fade_level(o.fade_level), images(std::move(o.images)) { o.forget_flags(); }
+        : rows(o.rows), cols(o.cols), cell(std::move(o.cell)), retained(o.retained), fade_level(o.fade_level), images(std::move(o.images)), vectors(std::move(o.vectors)) { o.forget_flags(); }
     Picture& operator=(Picture&& o) noexcept {
         if (this != &o) {
-            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained; fade_level = o.fade_level; images = std::move(o.images);
+            rows = o.rows; cols = o.cols; cell = std::move(o.cell); retained = o.retained; fade_level = o.fade_level; images = std::move(o.images); vectors = std::move(o.vectors);
             forget_flags(); o.forget_flags();
         }
         return *this;
@@ -365,6 +402,7 @@ struct Picture {
         rows = R + 1; cols = C;
         cell.assign((size_t)(R + 1) * C, PicCell());
         images.clear();                           // starting over: no pictures made of pixels either
+        vectors.clear();                          // nor drawings made of shapes
         fade_level = 0;
         forget_flags();
     }
@@ -520,6 +558,18 @@ inline void fade(const Picture& a, const Picture& b, double pct, Picture& out) {
         }
         out.images = std::move(mixed_images);
         out.fade_level = level;
+        // Drawings made of shapes carry their share (the Display dissolves them as pixels, or shows the one that is ahead).
+        out.vectors.clear();
+        for (size_t k = 0; k < a.vectors.size(); k++) {
+            VectorPlacement t = a.vectors[k];
+            t.weight *= wa; t.seed = level * 100003u + 3000u + (uint32_t)k;
+            if (t.weight > 0.0) out.vectors.push_back(std::move(t));
+        }
+        for (size_t k = 0; k < b.vectors.size(); k++) {
+            VectorPlacement t = b.vectors[k];
+            t.weight *= wb; t.seed = level * 100003u + 4000u + (uint32_t)k;
+            if (t.weight > 0.0) out.vectors.push_back(std::move(t));
+        }
     }
     out.touch_all();                          // every cell is written below
     for (size_t i = 0; i < a.cell.size(); i++) {
@@ -757,6 +807,25 @@ inline void set_image_support(int cell_w, int cell_h) {
     g_image_cell_w = cell_w > 0 ? cell_w : 0;
     g_image_cell_h = cell_h > 0 ? cell_h : 0;
 }
+// The same for ReGIS, if the terminal can draw it: the size of a character cell in pixels, and the size in pixels of the
+// ReGIS screen the terminal gives (xterm: its maxGraphicSize or the window, the smaller; ask with ESC [ ? 2 ; 1 ; 0 S, which
+// vtpen's probe does). Drawings made of shapes are then drawn with ReGIS lines. 0: they are drawn as pixels if
+// set_image_support was called, else ignored.
+inline int g_regis_cell_w = 0, g_regis_cell_h = 0, g_regis_surface_w = 0, g_regis_surface_h = 0;
+inline void set_regis_support(int cell_w, int cell_h, int surface_w, int surface_h) {
+    const bool ok = cell_w > 0 && cell_h > 0 && surface_w > 0 && surface_h > 0;
+    g_regis_cell_w = ok ? cell_w : 0;
+    g_regis_cell_h = ok ? cell_h : 0;
+    g_regis_surface_w = ok ? surface_w : 0;
+    g_regis_surface_h = ok ? surface_h : 0;
+}
+// The size of a character cell in pixels if the terminal can draw pictures made of shapes (as Sixel pixels or ReGIS lines),
+// else 0: what a scene needs to know to make a Drawing that fits a block of cells.
+inline int vector_cell_w() { return g_regis_cell_w > 0 ? g_regis_cell_w : g_image_cell_w; }
+inline int vector_cell_h() { return g_regis_cell_w > 0 ? g_regis_cell_h : g_image_cell_h; }
+// How soft the edges are when a Display shows a drawing as Sixel pixels (vtpen's set_edge_levels, 1 hard to 4 smoothest);
+// each Display starts with this and can change its own vector_edge_levels.
+inline int g_vector_edge_levels = 2;
 
 inline volatile sig_atomic_t g_stop = 0;
 inline void on_sigint(int) { g_stop = 1; }
@@ -1177,6 +1246,30 @@ public:
     }
     bool images_enabled() const { return img_cw_ > 0; }
 
+#ifdef VTSCREEN_VECTORS
+    // Say that the terminal can draw ReGIS: how big one of its character cells is, and how big the ReGIS screen is, in
+    // pixels (see set_regis_support). From now on the drawings made of shapes that a Picture carries (Picture::place_drawing)
+    // are drawn with ReGIS lines over the letters. A drawing is drawn after the letters of a frame; a letter written into
+    // a cell takes that cell's ReGIS pixels with it (as it does with Sixel), so when letters under a drawing change the
+    // drawing is drawn again. A drawing that changes is erased and drawn anew, never the whole ReGIS screen. 0 turns it off.
+    // Only the part of a drawing that lies inside the ReGIS screen is drawn (it starts at the top left of the window).
+    void enable_regis(int cell_w, int cell_h, int surface_w, int surface_h) {
+        if (cell_w > 0 && cell_h > 0 && surface_w > 0 && surface_h > 0) {
+            reg_cw_ = cell_w; reg_ch_ = cell_h;
+            vtpen::RegisOptions o;
+            o.surface_width = surface_w; o.surface_height = surface_h;
+            regis_ = std::make_unique<vtpen::Regis>(o);
+        } else {
+            reg_cw_ = reg_ch_ = 0;
+            regis_.reset();
+        }
+        image_reset();
+    }
+    bool regis_enabled() const { return reg_cw_ > 0; }
+    // How soft the edges of a drawing shown as pixels are (vtpen's set_edge_levels: 1 hard, 4 smoothest).
+    int vector_edge_levels = g_vector_edge_levels;
+#endif
+
     // The terminal changed size: cols x rows is the whole terminal, as in open().
     // The buffers are made again at the new size, the terminal is cleared and the
     // next frame sends everything. The pictures given from now on must be the new
@@ -1213,11 +1306,19 @@ public:
     // seconds (drives the shimmer). Returns the bytes to write to the terminal.
     std::string render(const Picture& pic, double t) {
         const bool images = img_cw_ > 0 && color;
+#ifdef VTSCREEN_VECTORS
+        const bool regis = reg_cw_ > 0 && color;
+#else
+        const bool regis = false;
+#endif
         render_t_ = t;
-        if (images) prepare_images(pic);            // what the pictures ask for, before the letters (some letters are held)
+        if (images) { gather_images(pic, regis); prepare_images(pic); }   // what the pictures ask for, before the letters (some letters are held)
         to_letters(pic, t);
         std::string out = send();
         if (images) out += send_images();
+#ifdef VTSCREEN_VECTORS
+        if (regis) out += send_vectors(pic);
+#endif
         return out;
     }
 
@@ -1309,11 +1410,17 @@ public:
         write_all(refresh());
         // The program said (set_image_support) that the terminal can draw Sixel pictures: use them (not without colour).
         if (g_image_cell_w > 0 && g_image_cell_h > 0 && o.color) enable_images(g_image_cell_w, g_image_cell_h);
+#ifdef VTSCREEN_VECTORS
+        if (g_regis_cell_w > 0 && o.color) enable_regis(g_regis_cell_w, g_regis_cell_h, g_regis_surface_w, g_regis_surface_h);
+#endif
         is_open = true;
     }
 
     void close() {
         if (!is_open) return;
+#ifdef VTSCREEN_VECTORS
+        if (regis_) write_all(regis_->clear());        // the ReGIS picture does not go away with the alternate screen on its own
+#endif
         write_all("\x1b[0m\x1b[?25h\x1b[?1049l");
 #ifdef VTSCREEN_WINDOWS
         if (out_console_) SetConsoleMode(hout_, old_out_mode_);
@@ -1491,6 +1598,7 @@ private:
     // Pictures made of pixels (see enable_images). The terminal wipes a cell's pixels when a letter is
     // written into it, so what is kept here is, per cell, whether there are pixels in it now.
     int img_cw_ = 0, img_ch_ = 0;                 // pixels per cell; 0: off
+    std::vector<ImagePlacement> img_list_;        // the pictures of this frame: the Picture's, and its drawings as pixels (see gather_images)
     std::vector<Pixel> img_on_;                   // the whole screen in pixels: what the terminal shows of the pictures
     std::vector<Pixel> img_want_;                 // the same size: what the pictures ask for, put together
     std::vector<unsigned char> img_ink_;          // per cell: there are picture pixels in it on the terminal
@@ -1515,6 +1623,26 @@ private:
     bool pen_alt = false;                         // ... and its background colour (none, or
     int par = -1, pag = -1, pab = -1;             //     this one)
     int cur_r = -1, cur_c = -1;                   // where its cursor is (-1: unknown)
+#ifdef VTSCREEN_VECTORS
+    // Drawings made of shapes. As ReGIS (enable_regis): what is on the ReGIS screen now, and which cells had a letter written
+    // into them since it was drawn. As pixels: the pixels of each drawing, kept while the same drawing comes again.
+    int reg_cw_ = 0, reg_ch_ = 0;                // pixels per cell; 0: ReGIS off
+    std::unique_ptr<vtpen::Regis> regis_;
+    struct VecShown {
+        std::shared_ptr<const vtpen::Drawing> drawing;
+        int row = 0, col = 0, rows = 0, cols = 0;
+        std::vector<int> cells;                   // when shown: the cells its ReGIS pixels are in (row * columns + column), a little generously
+    };
+    std::vector<VecShown> vec_shown_;
+    std::vector<unsigned char> vec_written_;      // per cell: a letter was written into it since the drawings were last looked at
+    struct RasterEntry {
+        std::shared_ptr<const vtpen::Drawing> drawing;
+        int rows = 0, cols = 0, cw = 0, ch = 0, edge = 0;
+        std::shared_ptr<const Raster> raster;
+        bool used = false;
+    };
+    std::vector<RasterEntry> raster_cache_;
+#endif
 
     // brightness and colour -> letter, inverse flag and rounded colour, for one cell
     VTSCREEN_FORCE_INLINE void letter(const PicCell& pc, int i, int j, double t, VtCell& out) const {
@@ -1591,6 +1719,10 @@ private:
         img_on_.clear(); img_want_.clear(); img_ink_.clear(); written_.clear(); img_hold_.clear(); hold_rate_.clear(); hold_slot_.clear();
         ink_count_ = 0;
         hold_any_ = false; img_active_ = false;
+#ifdef VTSCREEN_VECTORS
+        vec_shown_.clear(); vec_written_.clear();     // the screen was cleared, or is a new size: draw every drawing again
+        if (regis_) regis_->reset();                  // ... and send the colours again
+#endif
     }
 
     // May the held letter of cell idx change now? Each cell has a turn letter_rate times a second, at a moment of its own.
@@ -1606,6 +1738,12 @@ private:
 
     // A letter was written into cell (i, j): any picture pixels it had are gone.
     void note_letter(int i, int j) {
+#ifdef VTSCREEN_VECTORS
+        if (!vec_written_.empty()) {
+            const size_t k = (size_t)i * shown.cols + j;
+            if (k < vec_written_.size()) vec_written_[k] = 1;
+        }
+#endif
         if (ink_count_ == 0) return;
         const size_t idx = (size_t)i * shown.cols + j;
         if (idx < written_.size()) written_[idx] = 1;
@@ -1630,12 +1768,145 @@ private:
         return head;
     }
 
+    // The pictures made of pixels for this frame: the Picture's own, and, when the terminal does Sixel but not ReGIS, its
+    // drawings made of shapes turned into pixels (kept from frame to frame while the same drawing comes again).
+    void gather_images(const Picture& pic, bool regis) {
+        img_list_ = pic.images;
+#ifdef VTSCREEN_VECTORS
+        if (regis) return;
+        for (RasterEntry& e : raster_cache_) e.used = false;
+        for (const VectorPlacement& p : pic.vectors) {
+            if (!p.drawing || p.weight <= 0.0 || p.rows <= 0 || p.cols <= 0) continue;
+            RasterEntry* found = nullptr;
+            for (RasterEntry& e : raster_cache_)
+                if (e.drawing == p.drawing && e.rows == p.rows && e.cols == p.cols && e.cw == img_cw_ && e.ch == img_ch_ && e.edge == vector_edge_levels) { found = &e; break; }
+            if (!found) {
+                RasterEntry e;
+                e.drawing = p.drawing; e.rows = p.rows; e.cols = p.cols; e.cw = img_cw_; e.ch = img_ch_; e.edge = vector_edge_levels;
+                const int w = p.cols * img_cw_, h = p.rows * img_ch_;
+                vtpen::Canvas canvas(w, h, p.drawing->width(), p.drawing->height());
+                canvas.set_edge_levels(vector_edge_levels);
+                p.drawing->draw(canvas);
+                auto r = std::make_shared<Raster>();
+                r->init(w, h);
+                const vtpen::Rgb bg = canvas.background();
+                for (int y = 0; y < h; y++) {
+                    const vtpen::Rgb* src = canvas.row(y);
+                    Pixel* dst = &r->at(0, y);
+                    for (int x = 0; x < w; x++) if (!(src[x] == bg)) dst[x] = Pixel{src[x].r, src[x].g, src[x].b, 255};
+                }
+                e.raster = std::move(r);
+                raster_cache_.push_back(std::move(e));
+                found = &raster_cache_.back();
+            }
+            found->used = true;
+            ImagePlacement ip{found->raster, p.row, p.col, p.letter_rate};
+            if (p.weight < 1.0) ip = detail::thinned(ip, p.weight, p.seed);
+            if (ip.raster) img_list_.push_back(std::move(ip));
+        }
+        raster_cache_.erase(std::remove_if(raster_cache_.begin(), raster_cache_.end(), [](const RasterEntry& e) { return !e.used; }), raster_cache_.end());
+#else
+        (void)regis;
+#endif
+    }
+
+#ifdef VTSCREEN_VECTORS
+    // The cells a drawing's ReGIS pixels are in, a little generously (a pixel or two either side, since ReGIS rounds its lines
+    // its own way): worked out from the drawing drawn as pixels, hard edges.
+    std::vector<int> vector_footprint(const VecShown& v) const {
+        std::vector<int> cells;
+        const int w = v.cols * reg_cw_, h = v.rows * reg_ch_;
+        if (w <= 0 || h <= 0 || !v.drawing) return cells;
+        vtpen::Canvas canvas(w, h, v.drawing->width(), v.drawing->height());
+        canvas.set_edge_levels(1);
+        v.drawing->draw(canvas);
+        const vtpen::Rgb bg = canvas.background();
+        std::vector<unsigned char> mark((size_t)v.rows * v.cols, 0);
+        auto cell_of = [&](int x, int y) { x = std::max(0, std::min(w - 1, x)); y = std::max(0, std::min(h - 1, y)); return (size_t)(y / reg_ch_) * v.cols + (size_t)(x / reg_cw_); };
+        for (int y = 0; y < h; y++) {
+            const vtpen::Rgb* row = canvas.row(y);
+            for (int x = 0; x < w; x++) {
+                if (row[x] == bg) continue;
+                mark[cell_of(x, y)] = 1;
+                mark[cell_of(x - 2, y - 2)] = 1; mark[cell_of(x + 2, y - 2)] = 1; mark[cell_of(x - 2, y + 2)] = 1; mark[cell_of(x + 2, y + 2)] = 1;
+            }
+        }
+        const int cols = shown.cols, rows = shown.rows;
+        for (int r = 0; r < v.rows; r++)
+            for (int c = 0; c < v.cols; c++) {
+                const int i = v.row + r, j = v.col + c;
+                if (mark[(size_t)r * v.cols + c] && i >= 0 && i < rows && j >= 0 && j < cols) cells.push_back(i * cols + j);
+            }
+        return cells;
+    }
+
+    // Write the letter of cell (i, j) again, which takes its ReGIS pixels out. (Half of a wide letter is written through its first half.)
+    void rewrite_cell(std::string& out, int i, int j) {
+        const VtCell k = drawn(i, j);
+        const int head = ((k.attrs & CELL_TAIL) && j > 0) ? j - 1 : j;
+        put(out, i, head, drawn(i, head));
+    }
+
+    // Draw the drawings made of shapes with ReGIS, after the letters of the frame. A drawing that is the same one as last
+    // frame, in the same place, is left alone unless a letter was written into a cell it covers (which took the ReGIS
+    // pixels of that cell): then it is drawn again, on top. A drawing that changed, moved or went is not erased with ReGIS (an
+    // erased pixel is a black one that hides the letter under it): the letters in the cells its lines were in are written
+    // again, which takes the lines out and leaves the letters, and the new drawing is drawn on top, all in one ReGIS string. The
+    // ReGIS screen is never wiped as a whole.
+    std::string send_vectors(const Picture& pic) {
+        std::string out;
+        const int rows = shown.rows, cols = shown.cols;
+        if (vec_written_.size() != (size_t)rows * cols) vec_written_.assign((size_t)rows * cols, 0);
+        std::vector<VecShown> want;
+        for (const VectorPlacement& p : pic.vectors) {
+            if (!p.drawing || p.weight < 0.5 || p.rows <= 0 || p.cols <= 0) continue;
+            VecShown w;
+            w.drawing = p.drawing; w.row = p.row; w.col = p.col; w.rows = p.rows; w.cols = p.cols;
+            want.push_back(std::move(w));
+        }
+        if (want.empty() && vec_shown_.empty()) return out;
+        for (const VecShown& w : want) regis_->learn_palette(*w.drawing);       // the palette suits all of them, whichever is drawn first
+        auto rect = [&](const VecShown& v) { return vtpen::RegisRect{v.col * reg_cw_, v.row * reg_ch_, v.cols * reg_cw_, v.rows * reg_ch_}; };
+        auto same_place = [](const VecShown& a, const VecShown& b) {
+            return a.drawing == b.drawing && a.row == b.row && a.col == b.col && a.rows == b.rows && a.cols == b.cols;
+        };
+        auto letter_written_under = [&](const VecShown& v) {
+            const int i0 = std::max(0, v.row), i1 = std::min(rows - 1, v.row + v.rows - 1);
+            const int j0 = std::max(0, v.col), j1 = std::min(cols - 1, v.col + v.cols - 1);
+            for (int i = i0; i <= i1; i++)
+                for (int j = j0; j <= j1; j++)
+                    if (vec_written_[(size_t)i * cols + j]) return true;
+            return false;
+        };
+        const size_t n = std::max(want.size(), vec_shown_.size());
+        std::vector<char> is_new(n, 0);                                         // this one is not what was shown there: draw it, and take the old one off
+        for (size_t k = 0; k < n; k++) {
+            const bool had = k < vec_shown_.size(), has = k < want.size();
+            if (had && has && same_place(vec_shown_[k], want[k])) want[k].cells = vec_shown_[k].cells;
+            else {
+                is_new[k] = 1;
+                if (has) want[k].cells = vector_footprint(want[k]);
+                if (had)                                                         // the letters where its lines were, written again
+                    for (const int idx : vec_shown_[k].cells)
+                        if (!vec_written_[(size_t)idx]) rewrite_cell(out, idx / cols, idx % cols);
+            }
+        }
+        std::vector<vtpen::RegisOp> steps;
+        for (size_t k = 0; k < want.size(); k++)
+            if (is_new[k] || letter_written_under(want[k])) steps.push_back({false, want[k].drawing.get(), rect(want[k])});
+        out += regis_->batch(steps);
+        vec_shown_ = std::move(want);
+        std::fill(vec_written_.begin(), vec_written_.end(), (unsigned char)0);
+        return out;
+    }
+#endif
+
     // Put the pictures together for this frame (what the terminal should show of them), before the letters are chosen:
     // some letters may be held back under them (see ImagePlacement::letter_rate).
     void prepare_images(const Picture& pic) {
         img_active_ = false;
         hold_any_ = false;
-        if (pic.images.empty() && ink_count_ == 0) return;
+        if (img_list_.empty() && ink_count_ == 0) return;
         const int rows = shown.rows, cols = shown.cols, cw = img_cw_, ch = img_ch_;
         const int W = cols * cw, H = rows * ch;
         const int pic_rows = rows - 1;
@@ -1653,7 +1924,7 @@ private:
         // 1. the cells the pictures cover, and the ones that have pixels now
         int i0 = rows, i1 = -1, j0 = cols, j1 = -1;
         auto cover = [&](int i, int j) { i0 = std::min(i0, i); i1 = std::max(i1, i); j0 = std::min(j0, j); j1 = std::max(j1, j); };
-        for (const ImagePlacement& p : pic.images) {
+        for (const ImagePlacement& p : img_list_) {
             if (!p.raster || p.raster->w <= 0 || p.raster->h <= 0) continue;
             const int a = std::max(0, p.row), b = std::min(pic_rows - 1, p.row + (p.raster->h + ch - 1) / ch - 1);
             const int c = std::max(0, p.col), d = std::min(cols - 1, p.col + (p.raster->w + cw - 1) / cw - 1);
@@ -1672,7 +1943,7 @@ private:
             std::fill(img_want_.begin() + (std::ptrdiff_t)y * W + j0 * cw, img_want_.begin() + (std::ptrdiff_t)y * W + (j1 + 1) * cw, Pixel());
         std::fill(hold_rate_.begin(), hold_rate_.end(), -1.0f);       // -1: no picture that holds has pixels here
         std::fill(img_hold_.begin(), img_hold_.end(), (unsigned char)0);
-        for (const ImagePlacement& p : pic.images) {
+        for (const ImagePlacement& p : img_list_) {
             if (!p.raster) continue;
             const Raster& r = *p.raster;
             for (int y = 0; y < r.h; y++) {

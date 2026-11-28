@@ -214,6 +214,45 @@ quarter of the bytes and left a patchwork of stale cells, so the scene uses the 
 
 Not done yet: reading Sixel (decoding a picture a program sent) and carrying pictures through vtmux's virtual screen.
 
+## Drawings made of shapes
+
+A `Raster` says which pixels; a drawing says what is drawn: lines, curves and fills in colour, as a
+[vtpen](https://github.com/briefnotion/vtpen) `Drawing`. The Display can show the same drawing two ways, so the scene
+does not have to know which the terminal does: as ReGIS lines (DEC's vector language: VT125, VT240, VT340 and xterm
+built with ReGIS), which are small and do not depend on the size of the cells, or, on a terminal with only Sixel, as pixels,
+like a `Raster`. It needs vtpen's headers on the include path (`-I<vtpen>/include`); without them none of this exists
+(`VTSCREEN_VECTORS` is defined when it does) and nothing else changes.
+
+```cpp
+auto d = std::make_shared<vtpen::Drawing>(800, 480);       // the space the shapes are in
+d->set_colour({255, 200, 0});
+d->circle(400, 240, 100);
+F.place_drawing(d, row, col, rows, cols);                   // the drawing's whole space is stretched over these cells
+```
+
+A program says what the terminal can do before the Display is opened: `set_image_support(cell_w, cell_h)` for Sixel, and
+`set_regis_support(cell_w, cell_h, surface_w, surface_h)` for ReGIS (or `display.enable_images()` and
+`display.enable_regis()`). The ReGIS screen's size is the size of the biggest picture the terminal allows (vtpen's probe
+reads it); xterm's limit is its `maxGraphicSize`, 1000 x 1000 unless raised. With both, drawings go as ReGIS and
+`Raster`s as Sixel. With neither, drawings are ignored and the output is what it was without them, byte for byte.
+
+**How the Display draws them as ReGIS.** After the letters of a frame. Give the same drawing (the same `shared_ptr`) again and
+nothing is sent; a new one takes the old one off by writing again the letters in the cells its lines were in (an erased
+ReGIS pixel is a black one, which would hide the letter under it, as a black copy of the old drawing; a letter written into a
+cell takes that cell's ReGIS pixels out and leaves the letter) and is then drawn on top, all in one ReGIS string so the terminal
+never shows it half done; the ReGIS screen is never wiped as a whole except by `refresh()`. A letter written into a cell takes that cell's ReGIS pixels
+with it, as it takes Sixel pixels (seen in xterm), so when a letter is written under a drawing the drawing is drawn again
+on top. Letters that change all the time under a drawing mean it is drawn every frame. The colours are one palette of up
+to 15 for the whole screen, fixed from the drawings of the first frame (a colour that comes later takes the nearest). The ReGIS
+screen starts at the top left of the window: a drawing is drawn only where it lies on that screen, cut off, not squeezed.
+Scrolling the terminal's text with a ReGIS picture on screen is slow in xterm: do not.
+`fade()` carries drawings with a weight: as pixels they dissolve like a `Raster`, as ReGIS the one that is at least half
+there is drawn, so lines pop at the halfway point.
+
+When the Display closes, the ReGIS screen is wiped. Keep drawings out of the status bar's row (the last one).
+
+Not done: ReGIS is only checked in xterm 412 built with it (run as a VT340), not on a hardware terminal or another emulator.
+
 ## Tests
 
 `tests/run_tests.sh` builds `tests/retained_tests.cpp` with the strict warning flags and
@@ -244,6 +283,14 @@ pixels it does not draw), that after every one of about 2 000 random frames the 
 Display, except where letters are held back, and exactly the pixels the pictures ask for: nothing more, nothing less. Also
 that only what changed is sent, wide letters, the status bar's row, pictures that hang off the screen, overlapping
 pictures, clears and letter rates.
+
+`tests/vector_tests.cpp` (run by the same script when vtpen is found: next to this repository, or in `$VTPEN`) checks drawings made of
+shapes: that a Display not told sends exactly what it did before; that as Sixel the bytes are those of a `Raster` of the
+pixels vtpen makes, through changes of size and softness; and that as ReGIS, on a model of a terminal that follows the bytes
+(a letter wipes its cell's ReGIS pixels; vtpen's test reader reads the ReGIS), after every one of 300 random frames the screen
+shows the same letters as a letters-only Display and exactly the drawings' pixels. Also that a changed drawing is erased then drawn and the screen is never
+wiped, that a letter in the first or last cell under a drawing makes it drawn again and one beside does not, that nothing is sent
+when nothing changed, the clears, the weights `fade()` leaves, and a screen smaller than the drawings.
 
 `tests/bench_render.cpp` prints the timings above.
 
